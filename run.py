@@ -592,57 +592,66 @@ def cmd_review(cfg: dict, args) -> None:
     touched_ok = []
     done = []
     consecutive_failures = 0
-    for file in selected:
-        backup = None
-        try:
-            print(c(f"\n→ {file}", "cyan") + f"  ({reviews_by_file[file].count} comment(s))")
-            ok_before, _ = gate(cfg, file)
-            backup = backup_file(file)
-            prompt = build_prompt(reviews_by_file[file])
-            summary = run_worker(cfg, reviews_by_file[file])
-            if summary.get("error"):
+    try:
+        for file in selected:
+            backup = None
+            try:
+                print(c(f"\n→ {file}", "cyan") + f"  ({reviews_by_file[file].count} comment(s))")
+                ok_before, _ = gate(cfg, file)
+                backup = backup_file(file)
+                prompt = build_prompt(reviews_by_file[file])
+                summary = run_worker(cfg, reviews_by_file[file])
+                if summary.get("error"):
+                    restore_file(file, backup)
+                    if summary["error"] in ("limit", "timeout"):
+                        print(c(f"Usage/limit signal from the agent - stopping. Re-run to resume.", "yellow"))
+                        break
+                    print(c(f"Agent failed to return a valid JSON summary - skipped.", "red"))
+                    continue
+            except Exception as e:  # noqa: BLE001 — one bad file must not kill the batch
+                restore_file(file, backup)  # undo any partial edit
+                print(c(f"  error — skipped, kept for a later run: "
+                        f"{type(e).__name__}: {str(e)[:200]}", "red"))
+                _log_file(file, "error", {"applied": [], "skipped": []}, f"{type(e).__name__}: {e}")
+                continue  # not marked done -> a later `review` run retries it
+    
+            ok_after, detail = gate(cfg, file)
+    
+            if ok_after or not ok_before:
+                # kept: either it passed, or the file was already red (don't blame the worker)
+                action = "applied" if summary["applied"] else ("skipped" if summary["skipped"] else "no-op")
+                if not ok_after and not ok_before:
+                    action += " (gate still red, pre-existing)"
+                touched_ok.append(file) if summary["applied"] else None
+                consecutive_failures = 0
+                _log_file(file, action, summary, detail)
+                _print_file_result(action, summary)
+            else:
+                # regressed: worker broke a file that was clean -> revert
                 restore_file(file, backup)
-                if summary["error"] in ("limit", "timeout"):
-                    print(c(f"Usage/limit signal from the agent - stopping. Re-run to resume.", "yellow"))
-                    break
-                print(c(f"Agent failed to return a valid JSON summary - skipped.", "red"))
-                continue
-        except Exception as e:  # noqa: BLE001 — one bad file must not kill the batch
-            restore_file(file, backup)  # undo any partial edit
-            print(c(f"  error — skipped, kept for a later run: "
-                    f"{type(e).__name__}: {str(e)[:200]}", "red"))
-            _log_file(file, "error", {"applied": [], "skipped": []}, f"{type(e).__name__}: {e}")
-            continue  # not marked done -> a later `review` run retries it
+                consecutive_failures += 1
+                _log_file(file, "reverted", summary, detail)
+                print(c(f"  reverted — fix broke the gate: {detail[:200]}", "red"))
+                if consecutive_failures >= cfg["safety"]["consecutive_gate_failures_abort"]:
+                    print(c(f"\nAborting: {consecutive_failures} fixes broke the build in a row. "
+                            f"Something's off — take a look.", "red"))
+                    done.append(file)
+                    mark_done(file)
+                    _persist_pending(selected, done, reviews_by_file)
+                    _report(touched_ok)
+                    return
+    
+            done.append(file)
+            mark_done(file)
+            _persist_pending(selected, done, reviews_by_file)
+    
+    except KeyboardInterrupt:
+        print(c("
 
-        ok_after, detail = gate(cfg, file)
-
-        if ok_after or not ok_before:
-            # kept: either it passed, or the file was already red (don't blame the worker)
-            action = "applied" if summary["applied"] else ("skipped" if summary["skipped"] else "no-op")
-            if not ok_after and not ok_before:
-                action += " (gate still red, pre-existing)"
-            touched_ok.append(file) if summary["applied"] else None
-            consecutive_failures = 0
-            _log_file(file, action, summary, detail)
-            _print_file_result(action, summary)
-        else:
-            # regressed: worker broke a file that was clean -> revert
-            restore_file(file, backup)
-            consecutive_failures += 1
-            _log_file(file, "reverted", summary, detail)
-            print(c(f"  reverted — fix broke the gate: {detail[:200]}", "red"))
-            if consecutive_failures >= cfg["safety"]["consecutive_gate_failures_abort"]:
-                print(c(f"\nAborting: {consecutive_failures} fixes broke the build in a row. "
-                        f"Something's off — take a look.", "red"))
-                done.append(file)
-                mark_done(file)
-                _persist_pending(selected, done, reviews_by_file)
-                _report(touched_ok)
-                return
-
-        done.append(file)
-        mark_done(file)
+[!] Ctrl-C detected. Saving queue state so you can resume later...", "yellow"))
         _persist_pending(selected, done, reviews_by_file)
+        _report(touched_ok)
+        sys.exit(130)
 
     # finished the batch
     ok, detail = gate_crossfile(cfg, touched_ok)

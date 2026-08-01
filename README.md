@@ -1,12 +1,12 @@
 # Review Tool
 
-Automates the manual cycle of running code reviews, feeding findings to a coding agent, and applying fixes file by file. It runs CodeRabbit on your current changes or processes saved review files, working through findings **one file at a time** in an **isolated agent process** so context never piles up. Every change is verified using a local static analysis **gate**, and progress is logged cleanly to disk.
+Automates the manual cycle of running code reviews, feeding findings to a coding agent, and applying fixes file by file. It runs CodeRabbit on your current changes or processes saved review files, working through findings **one file at a time** in an **isolated agent process** so context never piles up. Every change is verified using a local static analysis **gate** (`py_compile` syntax checks and optional `ruff` linting), and progress is logged cleanly to disk.
 
 It **never runs git**. It leaves the working tree edited in place for your inspection. Nothing is committed, staged, or pushed.
 
 ---
 
-## CLI mode (default)
+## CLI mode
 
 The tool runs `coderabbit review --agent`, which emits **NDJSON** — one JSON object per line, carrying `severity`, `fileName`, and `codegenInstructions`.
 
@@ -41,18 +41,19 @@ The parser handles several formats:
    ```
 3. **Structured JSON**: JSON array containing `file`, `line`, `severity`, and `body` fields.
 
-Prerequisites: **ruff** (for static checks) and a configured coding agent on PATH (e.g., `opencode` or `claude` set in `agent.cmd`).
+Prerequisites: **Python 3**, a configured coding agent CLI on PATH (e.g., `opencode` set in `agent.cmd`), and optionally **ruff** for static lint checks (if installed, ruff runs automatically).
 
 ---
 
 ## Usage
 
 ```bash
-python run.py review                           # run one bounded batch (default)
+python run.py review                           # run one bounded batch (default 1 file per run)
 python run.py review --fresh                   # ignore any resumable queue and start a new cycle
 python run.py review --all                     # process all remaining files in the queue automatically
 python run.py review --review-file <path>      # read review findings from a specific file instead of fetching
 python run.py fetch                            # run CodeRabbit once and save to state/last_review.ndjson
+python run.py fetch --out <path>               # save the CodeRabbit review to a specific custom path
 python run.py status                           # show queue and today's tallies
 python run.py print-review                     # dump parsed review findings (for debugging/calibration)
 ```
@@ -62,20 +63,20 @@ python run.py print-review                     # dump parsed review findings (fo
 ## What one `review` run does
 
 1. **Reads review findings** (via CLI or `--review-file`) and **splits them by target file**.
-2. **Prioritizes files**: Files are ordered according to `selection.rank_by` (`"severity"` or `"paste_order"`). It selects up to `max_changed_files` per batch.
+2. **Prioritizes files**: Files are ordered according to `selection.rank_by` (`"severity"` or `"paste_order"`). It selects up to `max_changed_files` per batch (default 1 file per run).
 3. **Executes agent sessions**: Backs up each target file, then sends all suggestions for that file to **one fresh agent process** (isolated context).
 4. **Logs agent reasoning**: Detailed reasoning for each file is recorded in `state/reasoning/<timestamp>__<file>.md`.
-5. **Static gate verification**: Runs `py_compile` and `ruff --select <rules>` on modified files. If a fix breaks a file that was previously clean, that file is **reverted** and logged.
+5. **Static gate verification**: Runs `py_compile` syntax check and `ruff` (if available on PATH) on modified files. If a fix breaks a file that was previously clean, that file is **reverted** from backup and logged.
 6. **Records progress**: Applied and skipped findings are logged to `state/progress.jsonl`. A cross-file static check runs after the batch finishes.
 
-**Permissions:** The agent adapter is configured to run headless without prompt blocking (e.g., via `--permission-mode acceptEdits` in `agent.cmd`).
+**Permissions:** The agent adapter command is configured in `agent.cmd` (e.g. `opencode run --auto`) to run non-interactively without prompt blocking.
 
 ---
 
 ## Stop conditions
 
 - **A · Done** — No findings parsed (clean review), or every file in the review has already been processed.
-- **B · Day cap** — Processed `max_changed_files` files; remaining files wait for the next run.
+- **B · Batch cap** — Processed `max_changed_files` files; remaining files wait for the next run.
 - **C · Safety** —
   - A fix breaks a previously clean file -> file is reverted.
   - `consecutive_gate_failures_abort` consecutive gate failures -> run aborts.
@@ -96,15 +97,14 @@ python run.py print-review                     # dump parsed review findings (fo
 | `agent.timeout_sec` | Agent session execution timeout in seconds. |
 | `agent.limit_markers` | Array of output strings indicating usage/rate limits. |
 | `gate.py_compile` | Enable syntax validation via `py_compile` (default `true`). |
-| `gate.ruff` | Enable linting gate via `ruff` (default `true`). |
+| `gate.ruff` | Enable linting gate via `ruff` if available on PATH (default `true`). |
 | `gate.ruff_select` | Ruff rule selection (default `"E9,F63,F7,F82"`). |
 | `gate.end_of_run_crossfile` | Enable cross-file static check at batch completion. |
-| `selection.max_changed_files` | Maximum files processed per batch run. |
+| `selection.max_changed_files` | Maximum files processed per batch run (default `1`). |
 | `selection.max_examined_files` | Maximum candidate files evaluated per run. |
 | `selection.rank_by` | Ranking strategy: `"severity"` or `"paste_order"`. |
 | `selection.severity_order` | Priority list of severity levels when ranking by severity. |
-| `safety.consecutive_gate_failures_abort` | Consecutive gate failure limit before aborting batch. |
-| `safety.conservative_retry` | Safety retry behavior setting. |
+| `safety.consecutive_gate_failures_abort` | Consecutive gate failure limit before aborting batch (default `3`). |
 
 ---
 
