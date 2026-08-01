@@ -12,11 +12,11 @@ mirror. State lives on disk so a run interrupted by a usage limit can be resumed
 
 Commands:
     python run.py review        # run a bounded batch (default)
-    python run.py review --fresh # ignore any resumable queue, start a new cycle
-    python run.py standup        # build today's progress message from the work log
-    python run.py standup --all  # progress message across all logged work
-    python run.py print-review   # dump raw CodeRabbit output (calibration / debugging)
-    python run.py status         # show queue + today's tallies
+    python run.py review --fresh        # ignore any resumable queue, start a new cycle
+    python run.py review --review-file  # read the review from a saved file instead of the CLI
+    python run.py fetch                 # run ONE CodeRabbit review and save it for repeated use
+    python run.py print-review          # dump raw CodeRabbit output (calibration / debugging)
+    python run.py status                # show queue + today's tallies
 
 See README.md for setup and the stop conditions.
 """
@@ -132,7 +132,12 @@ class FileReview:
 
 
 def get_review(cfg: dict, review_file: str | None = None) -> str:
-    """Return the raw review text by running the CodeRabbit CLI."""
+    """Return the raw review text by running the CodeRabbit CLI or reading a review file."""
+    if review_file:
+        p = Path(review_file)
+        if not p.is_file():
+            sys.exit(c(f"Review file not found: {p}", "red"))
+        return p.read_text(encoding="utf-8")
     cr = cfg["coderabbit"]
     inner = list(cr["cmd"])
     if cr.get("dir"):
@@ -586,9 +591,11 @@ def cmd_review(cfg: dict, args) -> None:
     # -- Execution loop --
     touched_ok = []
     done = []
+    consecutive_failures = 0
     for file in selected:
+        backup = None
         try:
-            print(c(f"\\n→ {file}", "cyan") + f"  ({reviews_by_file[file].count} comment(s))")
+            print(c(f"\n→ {file}", "cyan") + f"  ({reviews_by_file[file].count} comment(s))")
             ok_before, _ = gate(cfg, file)
             backup = backup_file(file)
             prompt = build_prompt(reviews_by_file[file])
@@ -629,15 +636,13 @@ def cmd_review(cfg: dict, args) -> None:
                         f"Something's off — take a look.", "red"))
                 done.append(file)
                 mark_done(file)
-                _persist_pending(selected, done)
+                _persist_pending(selected, done, reviews_by_file)
                 _report(touched_ok)
                 return
 
         done.append(file)
         mark_done(file)
-        _persist_pending(selected, done)
-
-    _report(touched_ok)
+        _persist_pending(selected, done, reviews_by_file)
 
     # finished the batch
     ok, detail = gate_crossfile(cfg, touched_ok)
@@ -648,9 +653,10 @@ def cmd_review(cfg: dict, args) -> None:
     _report(touched_ok)
 
 
-def _persist_pending(selected: list[str], done: list[str]) -> None:
+def _persist_pending(selected: list[str], done: list[str], reviews_by_file: dict) -> None:
     q = load_queue() or {}
     q["pending"] = [f for f in selected if f not in done]
+    q["reviews"] = {f: r.text for f, r in reviews_by_file.items()}
     save_queue(q)
 
 
