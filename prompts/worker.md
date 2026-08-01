@@ -9,7 +9,7 @@ suggestions. Treat each distinct suggestion on its own.
 {findings}
 --- END REVIEW ---
 
-## Step 1 — Analyse every suggestion FIRST (do NOT edit code yet)
+## Step 1 - Analyse every suggestion FIRST (do NOT edit code yet)
 
 Before proposing or applying any change, for EACH suggestion work through this and write it
 out explicitly:
@@ -39,7 +39,7 @@ out explicitly:
 If assumptions are required, list them explicitly. Do NOT modify code until this analysis
 is complete for every suggestion.
 
-## Step 2 — Apply only what you recommended
+## Step 2 - Apply only what you recommended
 
 After the analysis is finished for all suggestions:
 - Apply the ones you concluded **Apply**. Edit ONLY `{file}`.
@@ -48,28 +48,31 @@ After the analysis is finished for all suggestions:
 Rules:
 1. Edit ONLY `{file}`. Do not touch or create any other file.
 2. Keep each change minimal and scoped to its suggestion; do not refactor unrelated code.
-3. Do NOT run git. Do not commit, stage, or push. Leave the file edited in place.
-4. Do NOT add comments that mention code review, AI, automation, or where a suggestion
+3. Any recommendation that depends on another file, shared configuration, or a
+   cross-file contract must be concluded **Needs more context**. Do not apply partial
+   edits for it; list it under "skipped" together with the dependency it relies on.
+4. Do NOT run git. Do not commit, stage, or push. Leave the file edited in place.
+5. Do NOT add comments that mention code review, AI, automation, or where a suggestion
    came from.
 
-## Step 3 — Summary (must be the LAST thing in your response)
+## Step 3 - Summary (must be the LAST thing in your response)
 
-Keep your full Step-1 analysis in the response above — it is the record of your reasoning.
+Keep your full Step-1 analysis in the response above - it is the record of your reasoning.
 Then end with ONLY this fenced json block and nothing after it:
 
 ```json
 {
   "file": "{file}",
   "applied": [
-    { "summary": "<plain standup sentence: what changed and why it matters>" }
+    { "summary": "<plain sentence: what changed and why it matters>" }
   ],
   "skipped": [
-    { "finding": "<short description of the suggestion>", "reason": "<Do not apply / Needs more context — why, in one line>" }
+    { "finding": "<short description of the suggestion>", "reason": "<Do not apply / Needs more context - why, in one line>" }
   ]
 }
 ```
 
-For each "applied" summary, use a developer's own voice — say what was fixed or improved.
+For each "applied" summary, use a developer's own voice - say what was fixed or improved.
 Do NOT mention tools, AI, "review", "suggestions", or where it came from. Examples:
   - "Fixed a crash on the settings page when a user had no saved profile."
   - "Stopped the export button from doing nothing on an empty list."

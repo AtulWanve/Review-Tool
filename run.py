@@ -12,7 +12,7 @@ State lives on disk so a run interrupted by a usage limit can be resumed.
 Commands:
     python run.py review        # run a bounded batch (default)
     python run.py review --fresh        # ignore any resumable queue, start a new cycle
-    python run.py review --review-file  # read the review from a saved file instead of the CLI
+    python run.py review --review-file state/last_review.ndjson  # read the review from a saved file instead of the CLI
     python run.py fetch                 # run ONE CodeRabbit review and save it for repeated use
     python run.py print-review          # dump raw CodeRabbit output (calibration / debugging)
     python run.py status                # show queue + today's tallies
@@ -99,7 +99,7 @@ def run_capture(cmd: list[str], *, stdin: str | None = None, timeout: int | None
         input=stdin,
         capture_output=True,
         text=True,
-        encoding="utf-8",     # not the Windows cp1252 locale — prompts/output carry → — etc.
+        encoding="utf-8",     # not the Windows cp1252 locale - prompts/output carry → - etc.
         errors="replace",
         timeout=timeout,
         cwd=str(cwd or REPO_ROOT),
@@ -165,7 +165,7 @@ def get_review(cfg: dict, review_file: str | None = None) -> str:
 
 
 # Segment the pasted review into one verbatim block PER FILE. The VS Code extension does
-# NOT tag severities, so we do not rely on severity words — we only detect file headers
+# NOT tag severities, so we do not rely on severity words - we only detect file headers
 # and keep each file's review text verbatim; the worker (with your analysis prompt) reasons
 # over the raw text.
 #
@@ -251,7 +251,7 @@ def _best_severity(values: list[str]) -> str:
 
 
 def _parse_ndjson_review(raw: str) -> list[FileReview] | None:
-    """`coderabbit review --agent` emits NDJSON — one JSON object per line:
+    """`coderabbit review --agent` emits NDJSON - one JSON object per line:
 
         {"type":"review_context",...}      {"type":"status",...}   {"type":"heartbeat",...}
         {"type":"finding","severity":"major","fileName":"a/b.py",
@@ -321,7 +321,7 @@ def parse_review(raw: str, cfg: dict) -> list[FileReview]:
         inline = _inline_finding_file(s)      # "In @path/file.py around lines .., <desc>"
         if inline:
             blocks.setdefault(inline, []).append(s)
-            continue                          # do NOT set current — keeps boilerplate lines out
+            continue                          # do NOT set current - keeps boilerplate lines out
         header = _file_header(s)              # fallback: a line that is essentially just a path
         if header:
             current = header
@@ -354,7 +354,7 @@ def _parse_json_review(data) -> list[FileReview]:
 # --------------------------------------------------------------------------- #
 def rank_files(reviews: list[FileReview], cfg: dict) -> list[FileReview]:
     """Order the files for this run. The extension doesn't tag severities, so the default
-    is PASTE ORDER — you set priority by pasting important files first. Set
+    is PASTE ORDER - you set priority by pasting important files first. Set
     selection.rank_by = "severity" to instead float files whose text mentions a
     severity/category word (critical, potential issue, ...) to the top."""
     if cfg["selection"].get("rank_by", "paste_order") == "severity":
@@ -402,7 +402,7 @@ class LimitReached(Exception):
 
 
 def _save_reasoning(file: str, prompt: str, stdout: str) -> None:
-    """Persist the agent's full analysis + actions so you can audit its reasoning later —
+    """Persist the agent's full analysis + actions so you can audit its reasoning later -
     one readable file per session under state/reasoning/."""
     REASONING_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now()
@@ -444,22 +444,51 @@ def gate(cfg: dict, file: str) -> tuple[bool, str]:
     path = REPO_ROOT / file
     if not path.is_file():
         return True, "file missing (skipped gate)"
-    if g.get("py_compile", True):
-        proc = run_capture([sys.executable, "-m", "py_compile", str(path)])
+
+    ext = path.suffix.lower()
+
+    # JSON syntax check (built-in, zero dependencies)
+    if ext == ".json":
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+            return True, "ok"
+        except Exception as e:
+            return False, f"json syntax error: {e}"
+
+    # Python syntax & lint gate
+    if ext == ".py":
+        if g.get("py_compile", True):
+            proc = run_capture([sys.executable, "-m", "py_compile", str(path)])
+            if proc.returncode != 0:
+                return False, "py_compile: " + (proc.stderr or proc.stdout).strip()
+        if g.get("ruff", True) and shutil.which("ruff"):
+            proc = run_capture(["ruff", "check", "--select", g.get("ruff_select", "E9,F63,F7,F82"),
+                                str(path)])
+            if proc.returncode != 0:
+                return False, "ruff: " + (proc.stdout or proc.stderr).strip()
+        return True, "ok"
+
+    # JavaScript syntax check (via node --check if node is on PATH)
+    if ext in (".js", ".mjs", ".cjs") and shutil.which("node"):
+        proc = run_capture(["node", "--check", str(path)])
         if proc.returncode != 0:
-            return False, "py_compile: " + (proc.stderr or proc.stdout).strip()
-    if g.get("ruff", True) and shutil.which("ruff"):
-        proc = run_capture(["ruff", "check", "--select", g.get("ruff_select", "E9,F63,F7,F82"),
-                            str(path)])
+            return False, "node --check: " + (proc.stderr or proc.stdout).strip()
+        return True, "ok"
+
+    # Go syntax check (via gofmt if gofmt is on PATH)
+    if ext == ".go" and shutil.which("gofmt"):
+        proc = run_capture(["gofmt", "-e", str(path)])
         if proc.returncode != 0:
-            return False, "ruff: " + (proc.stdout or proc.stderr).strip()
+            return False, "gofmt: " + (proc.stderr or proc.stdout).strip()
+        return True, "ok"
+
     return True, "ok"
 
 
 def gate_crossfile(cfg: dict, files: list[str]) -> tuple[bool, str]:
     if not (cfg["gate"].get("end_of_run_crossfile", True) and shutil.which("ruff") and files):
         return True, "ok"
-    paths = [str(REPO_ROOT / f) for f in files if (REPO_ROOT / f).is_file()]
+    paths = [str(REPO_ROOT / f) for f in files if (REPO_ROOT / f).is_file() and f.lower().endswith(".py")]
     if not paths:
         return True, "ok"
     proc = run_capture(["ruff", "check", "--select",
@@ -551,14 +580,24 @@ def cmd_review(cfg: dict, args) -> None:
         reviews_by_file = {f: FileReview(file=f, text=queue.get("reviews", {}).get(f, ""),
                                          count=0) for f in selected}
     else:
-        print(c("Reading review (CodeRabbit CLI)...", "cyan"))
-        raw = get_review(cfg, getattr(args, "review_file", None))
+        review_file = getattr(args, "review_file", None)
+        if not review_file and not getattr(args, "fresh", False):
+            saved_ndjson = STATE_DIR / "last_review.ndjson"
+            if saved_ndjson.is_file() and saved_ndjson.stat().st_size > 0:
+                review_file = str(saved_ndjson)
+
+        if review_file:
+            print(c(f"Reading review ({review_file})...", "cyan"))
+        else:
+            print(c("Reading review (CodeRabbit CLI)...", "cyan"))
+
+        raw = get_review(cfg, review_file)
         LAST_REVIEW.write_text(raw, encoding="utf-8")
         reviews = parse_review(raw, cfg)
 
         # STOP A: nothing parsed at all.
         if not reviews:
-            print(c("Nothing to review — no file suggestions found. Done.", "green"))
+            print(c("Nothing to review - no file suggestions found. Done.", "green"))
             clear_queue()
             return
 
@@ -573,7 +612,7 @@ def cmd_review(cfg: dict, args) -> None:
 
         # STOP A': every file in this review is already done.
         if not candidates:
-            print(c(f"All {len(reviews)} file(s) in this review are done - nothing left. Paste a new review, or run `review --fresh` to redo this one.", "green"))
+            print(c(f"All {len(reviews)} file(s) in this review are done - nothing left. Run `python run.py fetch` to get a new review, or `python run.py review --fresh` to redo this one.", "green"))
             clear_queue()
             return
 
@@ -607,9 +646,9 @@ def cmd_review(cfg: dict, args) -> None:
                         break
                     print(c(f"Agent failed to return a valid JSON summary - skipped.", "red"))
                     continue
-            except Exception as e:  # noqa: BLE001 — one bad file must not kill the batch
+            except Exception as e:  # noqa: BLE001 - one bad file must not kill the batch
                 restore_file(file, backup)  # undo any partial edit
-                print(c(f"  error — skipped, kept for a later run: "
+                print(c(f"  error - skipped, kept for a later run: "
                         f"{type(e).__name__}: {str(e)[:200]}", "red"))
                 _log_file(file, "error", {"applied": [], "skipped": []}, f"{type(e).__name__}: {e}")
                 continue  # not marked done -> a later `review` run retries it
@@ -630,10 +669,10 @@ def cmd_review(cfg: dict, args) -> None:
                 restore_file(file, backup)
                 consecutive_failures += 1
                 _log_file(file, "reverted", summary, detail)
-                print(c(f"  reverted — fix broke the gate: {detail[:200]}", "red"))
+                print(c(f"  reverted - fix broke the gate: {detail[:200]}", "red"))
                 if consecutive_failures >= cfg["safety"]["consecutive_gate_failures_abort"]:
                     print(c(f"\nAborting: {consecutive_failures} fixes broke the build in a row. "
-                            f"Something's off — take a look.", "red"))
+                            f"Something's off - take a look.", "red"))
                     done.append(file)
                     mark_done(file)
                     _persist_pending(selected, done, reviews_by_file)
@@ -645,9 +684,7 @@ def cmd_review(cfg: dict, args) -> None:
             _persist_pending(selected, done, reviews_by_file)
     
     except KeyboardInterrupt:
-        print(c("
-
-[!] Ctrl-C detected. Saving queue state so you can resume later...", "yellow"))
+        print(c("\n\n[!] Ctrl-C detected. Saving queue state so you can resume later...", "yellow"))
         _persist_pending(selected, done, reviews_by_file)
         _report(touched_ok)
         sys.exit(130)
@@ -655,7 +692,7 @@ def cmd_review(cfg: dict, args) -> None:
     # finished the batch
     ok, detail = gate_crossfile(cfg, touched_ok)
     if not ok:
-        print(c(f"\nHeads-up: cross-file static check flagged something after the batch — "
+        print(c(f"\nHeads-up: cross-file static check flagged something after the batch - "
                 f"worth a look:\n{detail[:500]}", "yellow"))
     clear_queue()
     _report(touched_ok)
@@ -682,9 +719,9 @@ def _print_file_result(action: str, summary: dict) -> None:
     for a in summary.get("applied", []):
         print(c(f"  ✓ {a.get('summary', '(no description)')}", "green"))
     for s in summary.get("skipped", []):
-        print(c(f"  – skipped: {s.get('reason', '')}", "grey"))
+        print(c(f"  - skipped: {s.get('reason', '')}", "grey"))
     if summary.get("_no_summary"):
-        print(c("  (agent returned no structured summary — kept changes, gate passed)", "grey"))
+        print(c("  (agent returned no structured summary - kept changes, gate passed)", "grey"))
 
 
 def _report(touched_ok: list[str]) -> None:
@@ -695,7 +732,7 @@ def _report(touched_ok: list[str]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# standup command  (code-generated, zero agent tokens)
+# status command output generation
 # --------------------------------------------------------------------------- #
 def _iter_progress():
     if not PROGRESS_LOG.is_file():
@@ -715,9 +752,9 @@ def cmd_print_review(cfg: dict, args) -> None:
     print(c("\n--- parsed as (file -> its review text) ---", "cyan"))
     reviews = parse_review(raw, cfg)
     if not reviews:
-        print(c("  (no files detected — _file_header() needs calibrating to this format)", "yellow"))
+        print(c("  (no files detected - _file_header() needs calibrating to this format)", "yellow"))
     for r in reviews:
-        print(c(f"\n{r.file}  ({r.count} comment line(s))", "bold"))
+        print(c(f"\n{r.file}  ({r.count} comment(s))", "bold"))
         for ln in r.text.splitlines():
             if ln.strip():
                 print(f"    {ln}")
@@ -737,19 +774,20 @@ def cmd_fetch(cfg: dict, args) -> None:
 
     reviews = parse_review(raw, cfg)
     if not reviews:
-        print(c("Review completed with no findings — nothing to fix.", "green"))
+        print(c("Review completed with no findings - nothing to fix.", "green"))
         return
     print(c(f"\nSaved review -> {out}", "green"))
-    print(f"{len(reviews)} file(s) with findings, {sum(r.count for r in reviews)} comment line(s):")
+    print(f"{len(reviews)} file(s) with findings, {sum(r.count for r in reviews)} comment(s):")
     for r in rank_files(reviews, cfg):
         print(f"  [{r.severity or '-':<8}] {r.file}")
-    print(c(f"\nNow work it one file per run:\n  python run.py review --review-file {out}", "cyan"))
+    review_cmd = "python run.py review" if out == (STATE_DIR / "last_review.ndjson") else f"python run.py review --review-file {out}"
+    print(c(f"\nNow work it one file per run:\n  {review_cmd}", "cyan"))
 
 
 def cmd_status(cfg: dict, args) -> None:
     q = load_queue()
     if q and q.get("pending"):
-        print(c(f"Resumable cycle: {len(q['pending'])} file(s) pending — {', '.join(q['pending'])}", "yellow"))
+        print(c(f"Resumable cycle: {len(q['pending'])} file(s) pending - {', '.join(q['pending'])}", "yellow"))
     else:
         print(c("No resumable cycle.", "grey"))
     proc = load_processed()

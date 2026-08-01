@@ -1,22 +1,31 @@
 # Review Tool
 
-Automates the manual cycle of running code reviews, feeding findings to a coding agent, and applying fixes file by file. It runs CodeRabbit on your current changes or processes saved review files, working through findings **one file at a time** in an **isolated agent process** so context never piles up. Every change is verified using a local static analysis **gate** (`py_compile` syntax checks and optional `ruff` linting), and progress is logged cleanly to disk.
+**Review Tool** automates the safe execution of CodeRabbit review findings. It processes one file at a time using isolated AI agent sessions, validates every change with a local static analysis gate, and records progress so interrupted review runs can be resumed.
 
 It **never runs git**. It leaves the working tree edited in place for your inspection. Nothing is committed, staged, or pushed.
 
 ---
 
+## Why Use Review Tool?
+
+- **One file = one fresh AI context**: Prevents LLM context degradation and token bloat on large code reviews.
+- **Static gate verification**: Runs `py_compile` syntax checks and optional `ruff` linting on modified files; invalid edits are automatically reverted.
+- **Resumable by design**: Progress and review hashes are logged to disk so you can pause and resume runs without repeating completed files.
+- **Git stays in your hands**: Edits remain uncommitted in your working tree for your final manual review.
+
+---
+
 ## CLI mode
 
-The tool runs `coderabbit review --agent`, which emits **NDJSON** — one JSON object per line, carrying `severity`, `fileName`, and `codegenInstructions`.
+The tool runs `coderabbit review --agent`, which emits **NDJSON** - one JSON object per line, carrying `severity`, `fileName`, and `codegenInstructions`.
 
-### Recommended workflow — fetch once, then work file by file
+### Recommended workflow - fetch once, then work file by file
 
 Running `review` directly via CLI triggers a new CodeRabbit review on each execution. To save review time and avoid hitting rate limits:
 
 ```bash
 python run.py fetch                                           # ONE review, saved to state/last_review.ndjson
-python run.py review --review-file state/last_review.ndjson   # processes 1 file (or add --all to process all files)
+python run.py review                                          # processes 1 file (or add --all to process all files)
 ```
 
 Progress is tracked against the saved review's hash, so each run advances to the next file and skips completed ones. When it reports *"all files done"*, run `fetch` again to refresh the review.
@@ -75,13 +84,13 @@ python run.py print-review                     # dump parsed review findings (fo
 
 ## Stop conditions
 
-- **A · Done** — No findings parsed (clean review), or every file in the review has already been processed.
-- **B · Batch cap** — Processed `max_changed_files` files; remaining files wait for the next run.
-- **C · Safety** —
+- **A · Done** - No findings parsed (clean review), or every file in the review has already been processed.
+- **B · Batch cap** - Processed `max_changed_files` files; remaining files wait for the next run.
+- **C · Safety** -
   - A fix breaks a previously clean file -> file is reverted.
   - `consecutive_gate_failures_abort` consecutive gate failures -> run aborts.
   - Usage/rate limit detected (`agent.limit_markers`) -> stops and preserves queue to resume later.
-- **D · Manual** — Ctrl-C saves current state; re-run to resume.
+- **D · Manual** - Ctrl-C saves current state; re-run to resume.
 
 ---
 
