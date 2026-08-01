@@ -1,181 +1,124 @@
-# review-loop
+# Review Tool
 
-Automates the manual cycle of *"CodeRabbit reviews → I copy the suggestions → paste
-into a coding agent → repeat."* It runs CodeRabbit on your current changes and works
-through the findings **one file at a time**, each file in a **fresh agent process** so
-context never piles up, gates every change with a fast static check, and writes a
-plain-language work log you can turn into a daily standup message.
+Automates the manual cycle of running code reviews, feeding findings to a coding agent, and applying fixes file by file. It runs CodeRabbit on your current changes or processes saved review files, working through findings **one file at a time** in an **isolated agent process** so context never piles up. Every change is verified using a local static analysis **gate**, and progress is logged cleanly to disk.
 
-It **never runs git.** It leaves the working tree edited in place for you to review and
-mirror to your second repo. Nothing is committed, staged, or pushed.
+It **never runs git**. It leaves the working tree edited in place for your inspection. Nothing is committed, staged, or pushed.
 
 ---
 
-## CLI mode (the default — free OAuth login, no paste)
+## CLI mode (default)
 
-The CodeRabbit CLI is Linux/macOS-only, so on Windows it runs inside **WSL** — only the
-review *read* crosses the boundary. Auth once with the **free OAuth login** (an
-`--api-key` needs a paid *agentic* key; you don't need that):
+The tool runs `coderabbit review --agent`, which emits **NDJSON** — one JSON object per line, carrying `severity`, `fileName`, and `codegenInstructions`.
 
-```bash
-# inside WSL, once:
-coderabbit auth login && coderabbit auth status
-```
+### Recommended workflow — fetch once, then work file by file
 
-The tool runs `coderabbit review --agent`, which emits **NDJSON** — one JSON object per
-line, with `finding` objects carrying `severity`, `fileName`, and `codegenInstructions`.
-That gives real severities, so `selection.rank_by` is `"severity"`.
-
-### The workflow — fetch once, then work it a file at a time
-
-`review` with `source:"cli"` triggers a **new** CodeRabbit review every run. At
-`max_changed_files: 1` that's one review per file — slow and rate-limit hungry. Instead:
+Running `review` directly via CLI triggers a new CodeRabbit review on each execution. To save review time and avoid hitting rate limits:
 
 ```bash
-python run.py fetch                                       # ONE review, saved + listed
-python run.py review --review-file state/last_review.ndjson   # 1 file per run, repeat
-python run.py standup                                     # the Slack message
+python run.py fetch                                           # ONE review, saved to state/last_review.ndjson
+python run.py review --review-file state/last_review.ndjson   # processes 1 file (or add --all to process all files)
 ```
 
-Progress is tracked against that saved review's hash, so each run advances to the next
-file and never redoes one. When it prints *"all files done"*, `fetch` again to re-review.
+Progress is tracked against the saved review's hash, so each run advances to the next file and skips completed ones. When it reports *"all files done"*, run `fetch` again to refresh the review.
 
-> ⚠️ **A whole-repo review of a very large diff can stall for hours.** Scope it with
-> `coderabbit.dir` (e.g. `"Utils"`, `"Services/kubernetes"`) or add `--light` to
-> `coderabbit.cmd`. A scoped review finishes in minutes.
-
-### Paste mode (no CLI needed)
-
-Set `coderabbit.source` to `"file"` and paste a review into `review.txt` (the extension's
-copy output — which is just the `codegenInstructions` text — parses fine). Same pipeline,
-no CodeRabbit auth or rate limit. Progress tracking works identically.
-
-Prereqs either way: **ruff** in your `.venv` (the gate) and **Claude Code** (`claude` on
-PATH, the default agent — change `agent.cmd` to swap tools). On native Mac/Linux set
-`coderabbit.use_wsl` to `false`.
+> ⚠️ **Scope large diffs:** To speed up large reviews, scope CodeRabbit with `coderabbit.dir` in `config.json` (e.g. `"src/utils"`, `"src/services"`).
 
 ---
 
-## Review format (already calibrated)
+## Review format & Saved / Pasted mode
 
-The parser is tuned to the format your paste uses: one finding per line, e.g.
-
-```
-In @Pages/Helm/ReleasesPage.py around lines 968 - 981, <description...>
-```
-
-It reads the `@`-prefixed repo path from each such line (ignoring the preamble and the
-repeated "Verify each finding…" boilerplate), and groups every finding for the same file
-together. Multiple findings for one file → one session. To see how any paste parses:
+You can process review files saved on disk or pasted from an editor extension using `--review-file`:
 
 ```bash
-python run.py print-review
+python run.py review --review-file review.txt
 ```
 
-If the format ever changes, the calibration points are `_inline_finding_file()` (the
-`In @path …` lines) and `_file_header()` (a fallback "path on its own line" layout).
+The parser handles several formats:
+1. **CodeRabbit NDJSON**: Output generated by `coderabbit review --agent`.
+2. **Inline text format**: One finding per block referencing repo paths, e.g.:
+   ```
+   In @src/utils/helpers.py around lines 45 - 50, <description...>
+   ```
+3. **Structured JSON**: JSON array containing `file`, `line`, `severity`, and `body` fields.
+
+Prerequisites: **ruff** (for static checks) and a configured coding agent on PATH (e.g., `opencode` or `claude` set in `agent.cmd`).
 
 ---
 
 ## Usage
 
 ```bash
-python run.py review        # run one bounded batch (the default)
-python run.py review --fresh # ignore any resumable queue and start a new cycle
-python run.py standup        # build TODAY'S progress message from the log
-python run.py standup --all  # progress message across everything logged
-python run.py status         # show the resumable queue + today's tallies
-python run.py print-review   # calibration / debugging
+python run.py review                           # run one bounded batch (default)
+python run.py review --fresh                   # ignore any resumable queue and start a new cycle
+python run.py review --all                     # process all remaining files in the queue automatically
+python run.py review --review-file <path>      # read review findings from a specific file instead of fetching
+python run.py fetch                            # run CodeRabbit once and save to state/last_review.ndjson
+python run.py status                           # show queue and today's tallies
+python run.py print-review                     # dump parsed review findings (for debugging/calibration)
 ```
-
-Typical day: `python run.py review`, eyeball the changes, mirror to the second repo,
-then `python run.py standup`, read the message, paste it to Slack.
 
 ---
 
 ## What one `review` run does
 
-1. Reads the review and **splits it by file** (verbatim text per file; the same file
-   appearing in several pasted reviews is merged, duplicate lines dropped).
-2. **Priority:** the extension doesn't tag severities, so files are taken in **paste
-   order** — you control priority by pasting important files first. It takes the top
-   `max_changed_files` (**the "day's work" cap** — the unit is *files*, so a file is never
-   split across runs). Set `selection.rank_by = "severity"` to instead float files whose
-   text mentions critical/potential issue/etc.
-3. For each file: backs it up → hands **all** of that file's suggestions to **one fresh
-   agent process** (isolated context, tokens not wasted re-loading). The agent runs your
-   **7-step analysis** on each suggestion (restate → current behavior → proposed fix →
-   result → necessity → risks → Apply/Do-not-apply/Needs-more-context), then applies only
-   the ones it recommends and skips the rest with reasons.
-4. **Its full reasoning is saved** to `state/reasoning/<timestamp>__<file>.md` — the prompt
-   plus the agent's whole analysis and actions, so you can audit any session later.
-5. **Gate:** `py_compile` + `ruff --select E9,F63,F7,F82` on the file. If a fix breaks a
-   file that was previously clean, that file is **reverted** and logged. (If the file was
-   already broken before we touched it, we don't blame the fix.)
-6. Logs each file's applied/skipped items to `state/progress.jsonl`; one cross-file static
-   pass after the batch.
+1. **Reads review findings** (via CLI or `--review-file`) and **splits them by target file**.
+2. **Prioritizes files**: Files are ordered according to `selection.rank_by` (`"severity"` or `"paste_order"`). It selects up to `max_changed_files` per batch.
+3. **Executes agent sessions**: Backs up each target file, then sends all suggestions for that file to **one fresh agent process** (isolated context).
+4. **Logs agent reasoning**: Detailed reasoning for each file is recorded in `state/reasoning/<timestamp>__<file>.md`.
+5. **Static gate verification**: Runs `py_compile` and `ruff --select <rules>` on modified files. If a fix breaks a file that was previously clean, that file is **reverted** and logged.
+6. **Records progress**: Applied and skipped findings are logged to `state/progress.jsonl`. A cross-file static check runs after the batch finishes.
 
-**Permissions:** the agent runs headless with `--permission-mode acceptEdits` and
-`--allowedTools Read,Edit,Write` (in `agent.cmd`), so it never blocks on a prompt and can't
-run shell or git. For zero checks, switch to `--permission-mode bypassPermissions`.
-
-The progress message (`standup`) is generated **from the log by code — zero agent
-tokens** — using the plain sentences the agent wrote for each applied change. No mention
-of tools, AI, or "review"; flat bullets in your own voice.
+**Permissions:** The agent adapter is configured to run headless without prompt blocking (e.g., via `--permission-mode acceptEdits` in `agent.cmd`).
 
 ---
 
-## Stop conditions (all armed every run)
+## Stop conditions
 
-- **A · Done** — no findings parsed (empty/clean review), **or** every file in the current
-  review has already been processed. Prints *"nothing left"* and exits.
-- **B · Day cap** — processed `max_changed_files` files; the rest wait for the next run,
-  which **skips the finished files** and advances to the next batch (progress is tracked
-  per review in `state/processed.json`; a new paste or `--fresh` resets it).
+- **A · Done** — No findings parsed (clean review), or every file in the review has already been processed.
+- **B · Day cap** — Processed `max_changed_files` files; remaining files wait for the next run.
 - **C · Safety** —
-  - a fix breaks a previously-clean file → that file is reverted (not a full stop);
-  - `consecutive_gate_failures_abort` reverts in a row → aborts the run;
-  - the agent signals a usage/rate limit (`agent.limit_markers`) → stops and keeps the
-    queue so a later run **resumes** where it left off.
-- **D · Manual** — Ctrl-C saves progress; re-run to resume.
-
-Because the queue + log live in `state/`, hitting your usage limit mid-run is safe: just
-run `review` again after it resets and it continues, skipping finished files.
+  - A fix breaks a previously clean file -> file is reverted.
+  - `consecutive_gate_failures_abort` consecutive gate failures -> run aborts.
+  - Usage/rate limit detected (`agent.limit_markers`) -> stops and preserves queue to resume later.
+- **D · Manual** — Ctrl-C saves current state; re-run to resume.
 
 ---
 
-## Config knobs (`config.json`)
+## Config options (`config.json`)
 
 | Key | Meaning |
 |---|---|
-| `coderabbit.source` | `"file"` — read the pasted review (default). `"cli"` — run the CLI (needs an agentic key). |
-| `coderabbit.review_file` | Where the pasted review lives (default `review.txt`). |
-| `coderabbit.use_wsl` | Only for `source:"cli"` — run the CLI inside WSL on Windows. |
-| `agent.cmd` | The coding-agent adapter (prompt on stdin, edits files, prints a ```json summary). Holds the permission flags. |
-| `agent.limit_markers` | Strings that mean "usage limit hit" → stop + keep queue for resume. |
-| `gate.ruff_select` | Rule set for the static gate. Default = syntax + undefined names. |
-| `selection.rank_by` | `"paste_order"` (default) or `"severity"`. See *What one run does*. |
-| `selection.max_changed_files` | The day cap (default 8 files/run). |
-| `selection.max_examined_files` | Absolute ceiling on files considered in one run. |
-| `safety.consecutive_gate_failures_abort` | Runaway guard (default 3). |
+| `coderabbit.cmd` | Command array to execute CodeRabbit CLI. |
+| `coderabbit.use_wsl` | Run the CodeRabbit CLI inside WSL on Windows. |
+| `coderabbit.dir` | Scope CodeRabbit review to a relative directory path. |
+| `coderabbit.timeout_sec` | CodeRabbit CLI execution timeout in seconds. |
+| `agent.cmd` | Command array for the coding agent adapter. |
+| `agent.timeout_sec` | Agent session execution timeout in seconds. |
+| `agent.limit_markers` | Array of output strings indicating usage/rate limits. |
+| `gate.py_compile` | Enable syntax validation via `py_compile` (default `true`). |
+| `gate.ruff` | Enable linting gate via `ruff` (default `true`). |
+| `gate.ruff_select` | Ruff rule selection (default `"E9,F63,F7,F82"`). |
+| `gate.end_of_run_crossfile` | Enable cross-file static check at batch completion. |
+| `selection.max_changed_files` | Maximum files processed per batch run. |
+| `selection.max_examined_files` | Maximum candidate files evaluated per run. |
+| `selection.rank_by` | Ranking strategy: `"severity"` or `"paste_order"`. |
+| `selection.severity_order` | Priority list of severity levels when ranking by severity. |
+| `safety.consecutive_gate_failures_abort` | Consecutive gate failure limit before aborting batch. |
+| `safety.conservative_retry` | Safety retry behavior setting. |
 
 ---
 
-## Swapping the agent (platform independence)
+## Swapping the agent adapter
 
-The only Claude-specific thing is `agent.cmd`. The contract for any replacement:
+The coding agent is specified via `agent.cmd`. Any agent CLI adapter can be used as long as it adheres to the contract:
 
-> Read the prompt on **stdin**, edit files in place, and print a fenced ` ```json ` block
-> matching the shape in `prompts/worker.md`.
+> Read the prompt on **STDIN**, edit files in place, and output a fenced ` ```json ` summary block matching `prompts/worker.md`.
 
-Point `agent.cmd` at any other agentic CLI that can do that and the loop is unchanged.
-Test with Claude first, then switch to keep your main Claude quota free.
+Update `agent.cmd` in `config.json` to swap between `opencode`, `claude`, or other compatible CLI tools.
 
 ---
 
 ## Deliberately NOT done
 
-- **No git.** No commit/stage/push. The output is a dirty working tree + `state/` logs.
-- **No test suite.** The gate is static-only by design. A real pytest suite (targeting
-  `Business_Logic` / `Services` / `Utils`) is a separate initiative.
-- **No auto-send to Slack.** `standup` only *generates* the message; you read and paste it.
+- **No git actions.** No commit, stage, or push operations. The output is an edited working tree + `state/` logs.
+- **No dynamic test execution.** The gate uses fast static analysis by default.
