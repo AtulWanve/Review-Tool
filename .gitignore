@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Application runtime state & temp review files
+state/
+review.txt
+*.log
+
+# IDE & Editor files
+.vscode/
+.idea/
+.qodo/
+.gemini/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local environment variables & secrets
+.env
+.env.local
