@@ -4,11 +4,10 @@ Review-loop orchestrator.
 
 Runs CodeRabbit on the current changes, then works through the findings ONE FILE
 AT A TIME, each file in a fresh coding-agent process (isolated context), gates each
-change with a fast static check, and records a plain-language work log you can turn
-into a daily standup message.
+change with a fast static check, and records progress cleanly to disk.
 
-It NEVER runs git. It leaves the working tree edited in place for you to review and
-mirror. State lives on disk so a run interrupted by a usage limit can be resumed.
+It NEVER runs git. It leaves the working tree edited in place for your inspection.
+State lives on disk so a run interrupted by a usage limit can be resumed.
 
 Commands:
     python run.py review        # run a bounded batch (default)

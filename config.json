@@ -14,7 +14,7 @@
         "timeout_sec": 900
     },
     "agent": {
-        "_comment": "The swappable coding-agent adapter. Contract: reads the prompt on STDIN, edits files in place, prints a ```json summary block on stdout. PERMISSIONS: '--permission-mode acceptEdits' auto-approves file edits, and '--allowedTools Read,Edit,Write' limits it to those tools so it never blocks on a prompt and can't run shell/git. For zero checks use '--permission-mode bypassPermissions'. Swap this whole array to move off Claude Code.",
+        "_comment": "The swappable coding-agent adapter. Contract: reads the prompt on STDIN, edits files in place, and outputs a fenced ```json summary block on stdout. Configure agent CLI arguments (e.g. '--auto' for opencode) in 'cmd'.",
         "cmd": [
             "opencode",
             "run",
@@ -32,14 +32,14 @@
         ]
     },
     "gate": {
-        "_comment": "Layered static gate. py_compile = syntax; ruff E9,F63,F7,F82 = the 'flake8 critical' set (syntax + undefined names). No GUI, no execution.",
+        "_comment": "Layered static gate. py_compile = syntax; ruff E9,F63,F7,F82 = critical error check set (syntax + undefined names).",
         "py_compile": true,
         "ruff": true,
         "ruff_select": "E9,F63,F7,F82",
         "end_of_run_crossfile": true
     },
     "selection": {
-        "_comment": "The 'day's work' cap. A FILE is the unit \u2014 all of a file's suggestions go to ONE session together. max_changed_files=1 means one file (one claude session) per run, so you control token spend by re-running when you have headroom. The extension does not tag severities, so rank_by defaults to 'paste_order': you set priority by pasting important files first. Set rank_by='severity' to float files whose text mentions critical/potential issue/etc.; severity_order applies only in that mode.",
+        "_comment": "The file batch cap. max_changed_files=1 means one file per run batch. Set rank_by='severity' to float files with critical/major issues first, or 'paste_order' to preserve review input order.",
         "max_changed_files": 1,
         "max_examined_files": 25,
         "rank_by": "severity",
@@ -53,7 +53,6 @@
         ]
     },
     "safety": {
-        "consecutive_gate_failures_abort": 3,
-        "conservative_retry": false
+        "consecutive_gate_failures_abort": 3
     }
 }

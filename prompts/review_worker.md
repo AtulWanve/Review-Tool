@@ -73,7 +73,7 @@ Do not write sleep-based or timing-dependent tests. Do not build a Qt harness.
 1. Edit ONLY `{file}` and, when Step 3 applies, files under `tests/`. Nothing else.
 2. Keep each change minimal and scoped to its finding; do not refactor unrelated code.
 3. Do NOT run git. Do not commit, stage, or push. Leave changes in the working tree.
-4. Do NOT run build scripts, generators, or any command that modifies files outside `{file}` or `tests/`. Running `python build_pages.py`, `mkdocs build`, or similar WILL regenerate many output files and cause the session to be aborted.
+4. Do NOT run build scripts, generators, or any command that modifies files outside `{file}` or `tests/`. Running build/generation tools WILL modify extra output files and cause the session to be aborted.
 5. Do NOT add comments mentioning code review, AI, automation, or where a finding came from.
 
 ## Step 4 — Summary (must be the LAST thing in your response)
