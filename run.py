@@ -152,6 +152,8 @@ def get_review(cfg: dict, review_file: str | None = None) -> str:
     
     try:
         proc = run_capture(cmd, timeout=cr.get("timeout_sec", 900))
+    except subprocess.TimeoutExpired:
+        sys.exit(c("CodeRabbit CLI timed out after " + str(cr.get("timeout_sec", 900)) + "s.\\nTo speed it up, specify a 'dir' in config.json to limit the scope of the review.", "yellow"))
     except FileNotFoundError:
         sys.exit(c(missing_hint, "red"))
     
@@ -419,7 +421,9 @@ def run_worker(cfg: dict, review: FileReview) -> dict:
     agent = cfg["agent"]
     prompt = build_prompt(review)
     try:
-        proc = run_capture(agent["cmd"], stdin=prompt, timeout=agent.get("timeout_sec", 600))
+        proc = run_capture(agent["cmd"], stdin=prompt, timeout=agent.get("timeout_sec", 900))
+    except subprocess.TimeoutExpired:
+        raise LimitReached()
     except FileNotFoundError:
         sys.exit(c(f"Coding agent not found ('{agent['cmd'][0]}'). Fix agent.cmd in config.json.", "red"))
     _save_reasoning(review.file, prompt, proc.stdout or "")

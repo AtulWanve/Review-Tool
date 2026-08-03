@@ -22,7 +22,7 @@
             "-m",
             "opencode/deepseek-v4-flash-free"
         ],
-        "timeout_sec": 600,
+        "timeout_sec": 900,
         "limit_markers": [
             "usage limit reached",
             "rate limit",
