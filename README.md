@@ -10,33 +10,34 @@ It **never runs git**. It leaves the working tree edited in place for your inspe
 
 - **One file = one fresh AI context**: Prevents LLM context degradation and token bloat on large code reviews.
 - **Static gate verification**: Runs `py_compile` syntax checks and optional `ruff` linting on modified files; invalid edits are automatically reverted.
+- **No-op guard**: SHA256-hashes the target file before and after the agent runs. If the file is byte-identical, the agent's claimed changes are discarded and the run is logged as a no-op.
 - **Resumable by design**: Progress and review hashes are logged to disk so you can pause and resume runs without repeating completed files.
+- **Per-project state isolation**: State is stored under `state/<repo-name>/`, so running the tool from different project directories never cross-contaminates queues, progress logs, or backups.
 - **Git stays in your hands**: Edits remain uncommitted in your working tree for your final manual review.
 
 ---
 
-## CLI mode
+## Workflow
 
-The tool runs `coderabbit review --agent`, which emits **NDJSON** - one JSON object per line, carrying `severity`, `fileName`, and `codegenInstructions`.
-
-### Recommended workflow - fetch once, then work file by file
-
-Running `review` directly via CLI triggers a new CodeRabbit review on each execution. To save review time and avoid hitting rate limits:
+`fetch` and `review` are strictly separate commands. `review` never calls CodeRabbit — it only works from a saved review. Always fetch first.
 
 ```bash
-python run.py fetch                                           # ONE review, saved to state/last_review.ndjson
-python run.py review                                          # processes 1 file (or add --all to process all files)
+python run.py fetch          # ONE CodeRabbit review, saved to state/<project>/last_review.ndjson
+python run.py review         # process 1 file from the saved review
+python run.py review --all   # process all remaining files in one go
 ```
 
-Progress is tracked against the saved review's hash, so each run advances to the next file and skips completed ones. When it reports *"all files done"*, run `fetch` again to refresh the review.
+Progress is tracked against the saved review's hash, so each `review` run advances to the next unprocessed file. When all files are done, run `fetch` again to get a fresh review.
 
 > ⚠️ **Scope large diffs:** To speed up large reviews, scope CodeRabbit with `coderabbit.dir` in `config.json` (e.g. `"src/utils"`, `"src/services"`).
 
 ---
 
-## Review format & Saved / Pasted mode
+## Review format & `--review-file`
 
-You can process review files saved on disk or pasted from an editor extension using `--review-file`:
+`review` always requires a saved review — either `state/<project>/last_review.ndjson` (written by `fetch`) or an explicit `--review-file`. It never calls CodeRabbit itself.
+
+To use a specific file instead of the auto-saved one:
 
 ```bash
 python run.py review --review-file review.txt
@@ -50,46 +51,49 @@ The parser handles several formats:
    ```
 3. **Structured JSON**: JSON array containing `file`, `line`, `severity`, and `body` fields.
 
-Prerequisites: **Python 3**, a configured coding agent CLI on PATH (e.g., `opencode` set in `agent.cmd`), and optionally **ruff** for static lint checks (if installed, ruff runs automatically).
+Prerequisites: **Python 3**, a configured coding agent CLI on PATH (e.g. `opencode` set in `agent.cmd`), and optionally **ruff** for static lint checks (if installed, ruff runs automatically).
 
 ---
 
 ## Usage
 
 ```bash
-python run.py review                           # run one bounded batch (default 1 file per run)
-python run.py review --fresh                   # ignore any resumable queue and start a new cycle
-python run.py review --all                     # process all remaining files in the queue automatically
-python run.py review --review-file <path>      # read review findings from a specific file instead of fetching
-python run.py fetch                            # run CodeRabbit once and save to state/last_review.ndjson
-python run.py fetch --out <path>               # save the CodeRabbit review to a specific custom path
+python run.py fetch                            # run ONE CodeRabbit review, save to state/<project>/last_review.ndjson
+python run.py fetch --out <path>               # save to a custom path instead
+python run.py review                           # process 1 file from the saved review
+python run.py review --all                     # process all remaining files in the saved review
+python run.py review --fresh                   # ignore resumable queue, restart from the saved review
+python run.py review --dry-run                 # show what would be sent to the agent, change nothing
+python run.py review --review-file <path>      # use a specific review file instead of the auto-saved one
 python run.py status                           # show queue and today's tallies
-python run.py print-review                     # dump parsed review findings (for debugging/calibration)
+python run.py print-review --review-file <path>  # dump parsed findings from a file (calibration)
 ```
+
+> `print-review` requires `--review-file`. Without it, it calls CodeRabbit directly — only use it that way intentionally.
 
 ---
 
 ## What one `review` run does
 
-1. **Reads review findings** (via CLI or `--review-file`) and **splits them by target file**.
-2. **Prioritizes files**: Files are ordered according to `selection.rank_by` (`"severity"` or `"paste_order"`). It selects up to `max_changed_files` per batch (default 1 file per run).
-3. **Executes agent sessions**: Backs up each target file, then sends all suggestions for that file to **one fresh agent process** (isolated context).
-4. **Logs agent reasoning**: Detailed reasoning for each file is recorded in `state/reasoning/<timestamp>__<file>.md`.
-5. **Static gate verification**: Runs `py_compile` syntax check and `ruff` (if available on PATH) on modified files. If a fix breaks a file that was previously clean, that file is **reverted** from backup and logged.
-6. **Records progress**: Applied and skipped findings are logged to `state/progress.jsonl`. A cross-file static check runs after the batch finishes.
-
-**Permissions:** The agent adapter command is configured in `agent.cmd` (e.g. `opencode run --auto`) to run non-interactively without prompt blocking.
+1. **Reads the saved review** (`state/<project>/last_review.ndjson` or `--review-file`) and splits findings by target file.
+2. **Skips already-processed files**: Progress is keyed by a hash of the review content, so re-runs advance to the next file automatically.
+3. **Prioritizes files**: Files are ordered by `selection.rank_by` (`"severity"` or `"paste_order"`). Selects up to `max_changed_files` per batch (default 1).
+4. **Executes agent sessions**: Backs up each target file, then sends all suggestions for that file to one fresh agent process (isolated context).
+5. **No-op guard**: SHA256-hashes the file before and after. If byte-identical, logs `no-op` and discards any claimed applied changes.
+6. **Static gate verification**: Runs `py_compile` and `ruff` (if available) on modified files. If a fix breaks a previously clean file, it is reverted from backup and logged.
+7. **Logs agent reasoning**: Full prompt + agent output saved to `state/<project>/reasoning/<timestamp>__<file>.md`.
+8. **Records progress**: Applied, skipped, no-op, and reverted entries logged to `state/<project>/progress.jsonl`. A cross-file static check runs after the batch.
 
 ---
 
 ## Stop conditions
 
-- **A · Done** - No findings parsed (clean review), or every file in the review has already been processed.
+- **A · Done** - All files in the saved review have been processed.
 - **B · Batch cap** - Processed `max_changed_files` files; remaining files wait for the next run.
 - **C · Safety** -
-  - A fix breaks a previously clean file -> file is reverted.
-  - `consecutive_gate_failures_abort` consecutive gate failures -> run aborts.
-  - Usage/rate limit detected (`agent.limit_markers`) -> stops and preserves queue to resume later.
+  - A fix breaks a previously clean file → file is reverted.
+  - `consecutive_gate_failures_abort` consecutive gate failures → run aborts.
+  - Usage/rate limit detected (`agent.limit_markers`) → stops and preserves queue to resume later.
 - **D · Manual** - Ctrl-C saves current state; re-run to resume.
 
 ---
@@ -103,6 +107,7 @@ python run.py print-review                     # dump parsed review findings (fo
 | `coderabbit.dir` | Scope CodeRabbit review to a relative directory path. |
 | `coderabbit.timeout_sec` | CodeRabbit CLI execution timeout in seconds. |
 | `agent.cmd` | Command array for the coding agent adapter. |
+| `agent.prompt_mode` | How the prompt is delivered: `"file"` passes it via `-f <tempfile>` (required for opencode); omit or set `"stdin"` for agents that read from stdin. |
 | `agent.timeout_sec` | Agent session execution timeout in seconds. |
 | `agent.limit_markers` | Array of output strings indicating usage/rate limits. |
 | `gate.py_compile` | Enable syntax validation via `py_compile` (default `true`). |
@@ -119,11 +124,31 @@ python run.py print-review                     # dump parsed review findings (fo
 
 ## Swapping the agent adapter
 
-The coding agent is specified via `agent.cmd`. Any agent CLI adapter can be used as long as it adheres to the contract:
+The coding agent is specified via `agent.cmd`. Two prompt delivery modes are supported via `agent.prompt_mode`:
 
-> Read the prompt on **STDIN**, edit files in place, and output a fenced ` ```json ` summary block matching `prompts/worker.md`.
+- `"file"` — writes the prompt to a temp file outside the repo and passes it via `-f <path>`. Required for **opencode**, which does not read from stdin.
+- `"stdin"` (or omitted) — pipes the prompt directly on stdin. Use for **claude** or other agents that accept stdin.
 
-Update `agent.cmd` in `config.json` to swap between `opencode`, `claude`, or other compatible CLI tools.
+The agent must edit the target file in place and output a fenced ` ```json ` summary block matching `prompts/worker.md`.
+
+---
+
+## State layout
+
+All state is stored inside the Review Tool directory, namespaced by the repo being reviewed:
+
+```
+state/
+  <repo-name>/
+    last_review.ndjson   # saved CodeRabbit output (written by fetch)
+    processed.json       # which files are done for the current review hash
+    queue.json           # resumable mid-batch queue (pending files + their review text)
+    progress.jsonl       # append-only log of every file action
+    backups/             # pre-agent file snapshots for revert
+    reasoning/           # full prompt + agent output per file session
+```
+
+Running from different project directories automatically uses separate subdirectories, so parallel projects never share state.
 
 ---
 
