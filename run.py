@@ -2,22 +2,20 @@
 """
 Review-loop orchestrator.
 
-Runs CodeRabbit on the current changes, then works through the findings ONE FILE
-AT A TIME, each file in a fresh coding-agent process (isolated context), gates each
-change with a fast static check, and records progress cleanly to disk.
+fetch and review are strictly separate flows — review never calls CodeRabbit.
 
-It NEVER runs git. It leaves the working tree edited in place for your inspection.
-State lives on disk so a run interrupted by a usage limit can be resumed.
+    python run.py fetch                        # ONE CodeRabbit review -> state/<project>/last_review.ndjson
+    python run.py review                       # process 1 file from the saved review
+    python run.py review --all                 # process all remaining files
+    python run.py review --fresh               # ignore resumable queue, restart from saved review
+    python run.py review --dry-run             # show what would be sent to the agent, change nothing
+    python run.py review --review-file <path>  # use a specific review file
+    python run.py fetch --out <path>           # save to a custom path
+    python run.py status                       # show queue + today's tallies
+    python run.py print-review                 # dump parsed review findings (calibration)
 
-Commands:
-    python run.py review        # run a bounded batch (default)
-    python run.py review --fresh        # ignore any resumable queue, start a new cycle
-    python run.py review --review-file state/last_review.ndjson  # read the review from a saved file instead of the CLI
-    python run.py fetch                 # run ONE CodeRabbit review and save it for repeated use
-    python run.py print-review          # dump raw CodeRabbit output (calibration / debugging)
-    python run.py status                # show queue + today's tallies
-
-See README.md for setup and the stop conditions.
+State is stored under state/<repo-name>/ so parallel projects never share queues or progress.
+See README.md for full details.
 """
 from __future__ import annotations
 
@@ -30,6 +28,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, date
 from pathlib import Path
@@ -37,21 +36,19 @@ from pathlib import Path
 TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "config.json"
 PROMPT_PATH = TOOL_DIR / "prompts" / "worker.md"
-STATE_DIR = TOOL_DIR / "state"
-BACKUP_DIR = STATE_DIR / "backups"
-REASONING_DIR = STATE_DIR / "reasoning"
-PROGRESS_LOG = STATE_DIR / "progress.jsonl"
-QUEUE_PATH = STATE_DIR / "queue.json"
-PROCESSED_PATH = STATE_DIR / "processed.json"
-LAST_REVIEW = STATE_DIR / "last_review.json"
 
 
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
 def load_config() -> dict:
-    with open(CONFIG_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        sys.exit(c(f"Config file not found at {CONFIG_PATH}. Please create one.", "red"))
+    except json.JSONDecodeError as e:
+        sys.exit(c(f"Invalid JSON in config.json: {e}", "red"))
 
 
 def find_repo_root() -> Path:
@@ -60,11 +57,20 @@ def find_repo_root() -> Path:
         if (p / ".git").exists():
             return p
         p = p.parent
-    # Fall back to CWD if no .git found
     return Path.cwd()
 
 
 REPO_ROOT = find_repo_root()
+
+# Per-project state: keyed by repo folder name so parallel projects never
+# share queue/progress/backup state.
+_PROJECT_KEY = REPO_ROOT.name
+STATE_DIR = TOOL_DIR / "state" / _PROJECT_KEY
+BACKUP_DIR = STATE_DIR / "backups"
+REASONING_DIR = STATE_DIR / "reasoning"
+PROGRESS_LOG = STATE_DIR / "progress.jsonl"
+QUEUE_PATH = STATE_DIR / "queue.json"
+PROCESSED_PATH = STATE_DIR / "processed.json"
 
 
 def win_to_wsl_path(p) -> str:
@@ -153,7 +159,7 @@ def get_review(cfg: dict, review_file: str | None = None) -> str:
     try:
         proc = run_capture(cmd, timeout=cr.get("timeout_sec", 900))
     except subprocess.TimeoutExpired:
-        sys.exit(c("CodeRabbit CLI timed out after " + str(cr.get("timeout_sec", 900)) + "s.\\nTo speed it up, specify a 'dir' in config.json to limit the scope of the review.", "yellow"))
+        sys.exit(c("CodeRabbit CLI timed out after " + str(cr.get("timeout_sec", 900)) + "s.\nTo speed it up, specify a 'dir' in config.json to limit the scope of the review.", "yellow"))
     except FileNotFoundError:
         sys.exit(c(missing_hint, "red"))
     
@@ -417,15 +423,39 @@ def _save_reasoning(file: str, prompt: str, stdout: str) -> None:
     )
 
 
+def _file_hash(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    except OSError:
+        return None
+
+
 def run_worker(cfg: dict, review: FileReview) -> dict:
     agent = cfg["agent"]
     prompt = build_prompt(review)
+    agent_cmd = list(agent["cmd"])
     try:
-        proc = run_capture(agent["cmd"], stdin=prompt, timeout=agent.get("timeout_sec", 900))
+        if agent.get("prompt_mode") == "file":
+            # opencode reads the prompt from a -f attachment, not stdin.
+            fd, ptmp = tempfile.mkstemp(prefix="review_tool_", suffix=".md")
+            os.close(fd)
+            Path(ptmp).write_text(prompt, encoding="utf-8")
+            try:
+                msg = ("Follow the instructions in the attached file EXACTLY. "
+                       "Edit the single file it names, then stop. Do not run git.")
+                proc = run_capture(agent_cmd + [msg, "-f", ptmp],
+                                   timeout=agent.get("timeout_sec", 900))
+            finally:
+                try:
+                    os.remove(ptmp)
+                except OSError:
+                    pass
+        else:
+            proc = run_capture(agent_cmd, stdin=prompt, timeout=agent.get("timeout_sec", 900))
     except subprocess.TimeoutExpired:
         raise LimitReached()
     except FileNotFoundError:
-        sys.exit(c(f"Coding agent not found ('{agent['cmd'][0]}'). Fix agent.cmd in config.json.", "red"))
+        sys.exit(c(f"Coding agent not found ('{agent_cmd[0]}'). Fix agent.cmd in config.json.", "red"))
     _save_reasoning(review.file, prompt, proc.stdout or "")
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     low = out.lower()
@@ -525,7 +555,10 @@ def append_progress(entry: dict) -> None:
 
 
 def save_queue(q: dict) -> None:
-    QUEUE_PATH.write_text(json.dumps(q, indent=2), encoding="utf-8")
+    try:
+        QUEUE_PATH.write_text(json.dumps(q, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(c(f"[!] Warning: Failed to save queue state: {e}", "yellow"))
 
 
 def load_queue() -> dict | None:
@@ -538,13 +571,16 @@ def load_queue() -> dict | None:
 
 
 def clear_queue() -> None:
-    if QUEUE_PATH.is_file():
-        QUEUE_PATH.unlink()
+    try:
+        if QUEUE_PATH.is_file():
+            QUEUE_PATH.unlink()
+    except OSError:
+        pass
 
 
-# Cross-run progress for ONE pasted review: which files are finished, so re-runs advance
-# to the next batch instead of redoing the same files. Keyed by a hash of the review text,
-# so pasting a new review (or --fresh) resets it automatically. The review file is never modified.
+# Cross-run progress for ONE review: which files are finished, so re-runs advance
+# to the next batch instead of redoing the same files. Keyed by a hash of the review
+# content, so fetching a new review (or --fresh) resets it automatically.
 def _review_hash(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -559,7 +595,10 @@ def load_processed() -> dict:
 
 
 def save_processed(p: dict) -> None:
-    PROCESSED_PATH.write_text(json.dumps(p, indent=2), encoding="utf-8")
+    try:
+        PROCESSED_PATH.write_text(json.dumps(p, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(c(f"[!] Warning: Failed to save processed state: {e}", "yellow"))
 
 
 def mark_done(file: str) -> None:
@@ -585,18 +624,14 @@ def cmd_review(cfg: dict, args) -> None:
                                          count=0) for f in selected}
     else:
         review_file = getattr(args, "review_file", None)
-        if not review_file and not getattr(args, "fresh", False):
-            saved_ndjson = STATE_DIR / "last_review.ndjson"
-            if saved_ndjson.is_file() and saved_ndjson.stat().st_size > 0:
-                review_file = str(saved_ndjson)
+        saved_ndjson = STATE_DIR / "last_review.ndjson"
+        if not review_file:
+            if not saved_ndjson.is_file() or saved_ndjson.stat().st_size == 0:
+                sys.exit(c(f"No saved review found. Run `python run.py fetch` first.", "red"))
+            review_file = str(saved_ndjson)
 
-        if review_file:
-            print(c(f"Reading review ({review_file})...", "cyan"))
-        else:
-            print(c("Reading review (CodeRabbit CLI)...", "cyan"))
-
+        print(c(f"Reading review ({review_file})...", "cyan"))
         raw = get_review(cfg, review_file)
-        LAST_REVIEW.write_text(raw, encoding="utf-8")
         reviews = parse_review(raw, cfg)
 
         # STOP A: nothing parsed at all.
@@ -630,6 +665,13 @@ def cmd_review(cfg: dict, args) -> None:
         selected = [r.file for r in chosen]
         reviews_by_file = {r.file: r for r in chosen}
 
+    if getattr(args, "dry_run", False):
+        for f in selected:
+            r = reviews_by_file[f]
+            print(c(f"\n=== would send: {r.file}  [{r.severity}]  ({r.count} comment(s))", "bold"))
+            print(r.text[:800])
+        return
+
     # -- Execution loop --
     touched_ok = []
     done = []
@@ -640,6 +682,7 @@ def cmd_review(cfg: dict, args) -> None:
             try:
                 print(c(f"\n→ {file}", "cyan") + f"  ({reviews_by_file[file].count} comment(s))")
                 ok_before, _ = gate(cfg, file)
+                hash_before = _file_hash(REPO_ROOT / file)
                 backup = backup_file(file)
                 prompt = build_prompt(reviews_by_file[file])
                 summary = run_worker(cfg, reviews_by_file[file])
@@ -650,6 +693,10 @@ def cmd_review(cfg: dict, args) -> None:
                         break
                     print(c(f"Agent failed to return a valid JSON summary - skipped.", "red"))
                     continue
+            except LimitReached:
+                restore_file(file, backup)
+                print(c(f"Usage/limit signal from the agent - stopping. Re-run to resume.", "yellow"))
+                break
             except Exception as e:  # noqa: BLE001 - one bad file must not kill the batch
                 restore_file(file, backup)  # undo any partial edit
                 print(c(f"  error - skipped, kept for a later run: "
@@ -657,8 +704,23 @@ def cmd_review(cfg: dict, args) -> None:
                 _log_file(file, "error", {"applied": [], "skipped": []}, f"{type(e).__name__}: {e}")
                 continue  # not marked done -> a later `review` run retries it
     
+            # No-op guard: if the target file is byte-identical after the agent ran,
+            # it did nothing regardless of what its summary claims.
+            hash_after = _file_hash(REPO_ROOT / file)
+            if hash_after == hash_before and hash_before is not None:
+                if summary.get("applied"):
+                    print(c(f"  NO-OP: agent claimed changes but {file} is byte-identical - discarding.", "red"))
+                    summary["skipped"] = summary.get("skipped", []) + [{"reason": "agent reported changes it did not make"}]
+                    summary["applied"] = []
+                restore_file(file, backup)
+                _log_file(file, "no-op", summary, "byte-identical after agent")
+                done.append(file)
+                mark_done(file)
+                _persist_pending(selected, done, reviews_by_file)
+                continue
+
             ok_after, detail = gate(cfg, file)
-    
+
             if ok_after or not ok_before:
                 # kept: either it passed, or the file was already red (don't blame the worker)
                 action = "applied" if summary["applied"] else ("skipped" if summary["skipped"] else "no-op")
@@ -770,7 +832,7 @@ def cmd_fetch(cfg: dict, args) -> None:
     ensure_state()
     forced = {**cfg, "coderabbit": {**cfg["coderabbit"], "source": "cli"}}
     scope = cfg["coderabbit"].get("dir") or "whole repo"
-    print(c(f"Running CodeRabbit ({scope})... this can take minutes.", "cyan"))
+    print(c(f"[{_PROJECT_KEY}] Running CodeRabbit ({scope})... this can take minutes.", "cyan"))
     raw = get_review(forced, None)
     out = Path(args.out) if args.out else (STATE_DIR / "last_review.ndjson")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -821,6 +883,8 @@ def main() -> None:
     p_rev = sub.add_parser("review", help="run a bounded review/fix batch (default)")
     p_rev.add_argument("--fresh", action="store_true", help="ignore any resumable queue")
     p_rev.add_argument("--all", action="store_true", help="loop until every file in the queue is done")
+    p_rev.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       help="show what would be sent to the agent, change nothing")
     p_rev.add_argument("--review-file", dest="review_file", default=None,
                        help="read the review from this file instead of the CLI")
 
@@ -849,4 +913,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(c("\n\n[!] Operation cancelled by user (Ctrl-C).", "yellow"))
+        sys.exit(130)
