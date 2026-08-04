@@ -14,7 +14,7 @@
         "timeout_sec": 900
     },
     "agent": {
-        "_comment": "The swappable coding-agent adapter. Contract: reads the prompt on STDIN, edits files in place, and outputs a fenced ```json summary block on stdout. Configure agent CLI arguments (e.g. '--auto' for opencode) in 'cmd'.",
+        "_comment": "The swappable coding-agent adapter. prompt_mode='file' passes the prompt via -f <tempfile> (required for opencode); omit or set 'stdin' for agents that read from stdin (e.g. claude -p).",
         "cmd": [
             "opencode",
             "run",
@@ -22,13 +22,14 @@
             "-m",
             "opencode/deepseek-v4-flash-free"
         ],
+        "prompt_mode": "file",
         "timeout_sec": 900,
         "limit_markers": [
             "usage limit reached",
-            "rate limit",
             "quota exceeded",
-            "429",
-            "overloaded"
+            "http 429",
+            "status code 429",
+            "api limit exceeded"
         ]
     },
     "gate": {
