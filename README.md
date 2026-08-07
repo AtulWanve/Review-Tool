@@ -58,7 +58,10 @@ Prerequisites: **Python 3**, a configured coding agent CLI on PATH (e.g. `openco
 ## Usage
 
 ```bash
-python run.py fetch                            # run ONE CodeRabbit review, save to state/<project>/last_review.ndjson
+python run.py fetch                            # review staged/modified tracked files (default), save to state/<project>/last_review.ndjson
+python run.py fetch --untracked                # review modified tracked files PLUS newly created files
+python run.py fetch --committed                # review only committed changes against the base branch
+python run.py fetch --all-files                # review the entire branch
 python run.py fetch --out <path>               # save to a custom path instead
 python run.py review                           # process 1 file from the saved review
 python run.py review --all                     # process all remaining files in the saved review

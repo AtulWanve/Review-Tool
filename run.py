@@ -293,8 +293,8 @@ def _parse_ndjson_review(raw: str) -> list[FileReview] | None:
         if not f or not body:
             continue
         rf = _looks_like_repo_file(str(f)) or str(f).replace("\\", "/")
-        # extend line-wise so _blocks_to_reviews collapses the repeated boilerplate line
-        blocks.setdefault(rf, []).extend(body.splitlines())
+        # append the full body text as one chunk for deduplication
+        blocks.setdefault(rf, []).append(body)
         if o.get("severity"):
             sevs.setdefault(rf, []).append(str(o["severity"]).strip().lower())
 
@@ -456,6 +456,10 @@ def run_worker(cfg: dict, review: FileReview) -> dict:
         raise LimitReached()
     except FileNotFoundError:
         sys.exit(c(f"Coding agent not found ('{agent_cmd[0]}'). Fix agent.cmd in config.json.", "red"))
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        sys.exit(c(f"Error executing agent: {e}", "red"))
     _save_reasoning(review.file, prompt, proc.stdout or "")
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     low = out.lower()
@@ -620,8 +624,12 @@ def cmd_review(cfg: dict, args) -> None:
     if queue and queue.get("pending"):
         print(c(f"Resuming previous cycle: {len(queue['pending'])} file(s) left.", "cyan"))
         selected = queue["pending"]
+        # Count is roughly the number of distinct comment chunks separated by \n\n
+        def _count(text: str) -> int:
+            return len([c for c in text.split("\n\n") if c.strip()])
         reviews_by_file = {f: FileReview(file=f, text=queue.get("reviews", {}).get(f, ""),
-                                         count=0) for f in selected}
+                                         count=_count(queue.get("reviews", {}).get(f, "")))
+                           for f in selected}
     else:
         review_file = getattr(args, "review_file", None)
         saved_ndjson = STATE_DIR / "last_review.ndjson"
@@ -714,6 +722,7 @@ def cmd_review(cfg: dict, args) -> None:
                     summary["applied"] = []
                 restore_file(file, backup)
                 _log_file(file, "no-op", summary, "byte-identical after agent")
+                _print_file_result("no-op", summary)
                 done.append(file)
                 mark_done(file)
                 _persist_pending(selected, done, reviews_by_file)
@@ -786,8 +795,11 @@ def _print_file_result(action: str, summary: dict) -> None:
         print(c(f"  ✓ {a.get('summary', '(no description)')}", "green"))
     for s in summary.get("skipped", []):
         print(c(f"  - skipped: {s.get('reason', '')}", "grey"))
-    if summary.get("_no_summary"):
-        print(c("  (agent returned no structured summary - kept changes, gate passed)", "grey"))
+    if not summary.get("applied") and not summary.get("skipped"):
+        if summary.get("_no_summary"):
+            print(c("  (agent returned no structured summary)", "grey"))
+        else:
+            print(c(f"  (no changes made - agent concluded nothing to apply)", "grey"))
 
 
 def _report(touched_ok: list[str]) -> None:
@@ -830,13 +842,49 @@ def cmd_fetch(cfg: dict, args) -> None:
     """Run ONE CodeRabbit review and save it, so you can then work through it a file at a
     time without burning a review (and a rate-limit slot) on every run."""
     ensure_state()
+    
+    # Allow overriding the review mode via CLI flags
     forced = {**cfg, "coderabbit": {**cfg["coderabbit"], "source": "cli"}}
-    scope = cfg["coderabbit"].get("dir") or "whole repo"
-    print(c(f"[{_PROJECT_KEY}] Running CodeRabbit ({scope})... this can take minutes.", "cyan"))
+    if getattr(args, "mode", None):
+        # Strip out any existing --type, --committed, --uncommitted, --include-untracked, --all-files flags
+        base_cmd = []
+        skip_next = False
+        for i, a in enumerate(forced["coderabbit"]["cmd"]):
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--type":
+                skip_next = True
+                continue
+            if a in ("--committed", "--uncommitted", "--include-untracked", "--all-files"):
+                continue
+            base_cmd.append(a)
+            
+        # Append the requested mode flag
+        if args.mode == "uncommitted":
+            base_cmd.append("--uncommitted")
+        elif args.mode == "committed":
+            base_cmd.append("--committed")
+        elif args.mode == "untracked":
+            base_cmd.extend(["--uncommitted", "--include-untracked"])
+        elif args.mode == "all":
+            # CodeRabbit might not have a single flag for "entire repo including committed",
+            # but usually omitting --uncommitted/--committed makes it run a full branch review.
+            pass
+            
+        forced["coderabbit"]["cmd"] = base_cmd
+
+    scope = forced["coderabbit"].get("dir") or "whole repo"
+    mode_str = f" (mode: {args.mode})" if getattr(args, "mode", None) else ""
+    print(c(f"[{_PROJECT_KEY}] Running CodeRabbit ({scope}){mode_str}... this can take minutes.", "cyan"))
     raw = get_review(forced, None)
     out = Path(args.out) if args.out else (STATE_DIR / "last_review.ndjson")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(raw, encoding="utf-8")
+
+    # Reset progress when a new fetch is explicitly requested
+    save_processed({"review_hash": _review_hash(raw), "done": []})
+    clear_queue()
 
     reviews = parse_review(raw, cfg)
     if not reviews:
@@ -859,7 +907,7 @@ def cmd_status(cfg: dict, args) -> None:
     proc = load_processed()
     if proc.get("done"):
         print(c(f"Current review: {len(proc['done'])} file(s) processed so far "
-                f"(re-runs skip these; a new paste or --fresh resets).", "grey"))
+                f"(re-runs skip these; fetch or --fresh resets).", "grey"))
     today = date.today().isoformat()
     applied = reverted = skipped = 0
     for e in _iter_progress():
@@ -894,6 +942,16 @@ def main() -> None:
 
     p_f = sub.add_parser("fetch", help="run ONE CodeRabbit review and save it for repeated use")
     p_f.add_argument("--out", default=None, help="where to save (default state/last_review.ndjson)")
+    
+    mode_group = p_f.add_mutually_exclusive_group()
+    mode_group.add_argument("--uncommitted", dest="mode", action="store_const", const="uncommitted", 
+                           help="Review staged changes and modified tracked files (default)")
+    mode_group.add_argument("--committed", dest="mode", action="store_const", const="committed",
+                           help="Review only committed changes on the branch")
+    mode_group.add_argument("--untracked", dest="mode", action="store_const", const="untracked",
+                           help="Review uncommitted changes PLUS untracked files")
+    mode_group.add_argument("--all-files", dest="mode", action="store_const", const="all",
+                           help="Review the entire branch against base")
 
     sub.add_parser("status", help="show queue + today's tallies")
 
