@@ -423,6 +423,37 @@ def _save_reasoning(file: str, prompt: str, stdout: str) -> None:
     )
 
 
+
+def in_allowed_scope(path: str, target: str) -> bool:
+    """Returns True if the path is the target file, or is inside a tests/ directory."""
+    path = path.replace("\\", "/")
+    target = target.replace("\\", "/")
+    if path == target:
+        return True
+    return "tests" in Path(path).parts
+
+def _porcelain() -> list[str]:
+    proc = run_capture(["git", "status", "--porcelain", "-z"])
+    if proc.returncode != 0: return []
+    return [p for p in proc.stdout.split(chr(0)) if p]
+
+def _changed_paths(porcelain: list[str]) -> set[str]:
+    # Parse git status --porcelain -z output
+    changed = set()
+    i = 0
+    while i < len(porcelain):
+        line = porcelain[i]
+        if not line:
+            i += 1
+            continue
+        status = line[:2]
+        path = line[3:]
+        changed.add(path)
+        if status.startswith("R") or status.startswith("C"):
+            i += 1  # skip the original path in renames/copies
+        i += 1
+    return changed
+
 def _file_hash(path: Path) -> str | None:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
@@ -442,7 +473,8 @@ def run_worker(cfg: dict, review: FileReview) -> dict:
             Path(ptmp).write_text(prompt, encoding="utf-8")
             try:
                 msg = ("Follow the instructions in the attached file EXACTLY. "
-                       "Edit the single file it names, then stop. Do not run git.")
+                       "Edit the target file, and you may also edit related tests in the "
+                       "tests/ directory if required by the instructions. Do not run git.")
                 proc = run_capture(agent_cmd + [msg, "-f", ptmp],
                                    timeout=agent.get("timeout_sec", 900))
             finally:
@@ -689,8 +721,11 @@ def cmd_review(cfg: dict, args) -> None:
             backup = None
             try:
                 print(c(f"\n→ {file}", "cyan") + f"  ({reviews_by_file[file].count} comment(s))")
+
+                # We still gate and hash the target file for the fast-path checks
                 ok_before, _ = gate(cfg, file)
                 hash_before = _file_hash(REPO_ROOT / file)
+                # Keep a backup reference for the target file for the existing restore_file calls
                 backup = backup_file(file)
                 prompt = build_prompt(reviews_by_file[file])
                 summary = run_worker(cfg, reviews_by_file[file])
@@ -711,7 +746,6 @@ def cmd_review(cfg: dict, args) -> None:
                         f"{type(e).__name__}: {str(e)[:200]}", "red"))
                 _log_file(file, "error", {"applied": [], "skipped": []}, f"{type(e).__name__}: {e}")
                 continue  # not marked done -> a later `review` run retries it
-    
             # No-op guard: if the target file is byte-identical after the agent ran,
             # it did nothing regardless of what its summary claims.
             hash_after = _file_hash(REPO_ROOT / file)
