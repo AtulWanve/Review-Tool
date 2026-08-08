@@ -3,18 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
 # Python tooling caches
-.pytest_cache/
 .ruff_cache/
-.mypy_cache/
-.coverage
-htmlcov/
 
 # Application runtime state & temp review files
 state/
@@ -31,6 +21,6 @@ review.txt
 .DS_Store
 Thumbs.db
 
-# Local environment variables & secrets
-.env
-.env.local
+# Project context files
+CLAUDE.md
+CONTEXT.md
