@@ -467,14 +467,21 @@ def run_worker(cfg: dict, review: FileReview) -> dict:
     agent_cmd = list(agent["cmd"])
     try:
         if agent.get("prompt_mode") == "file":
-            # Pass the prompt via stdin instead of attaching as a file,
-            # ensuring Claude treats it as the actual user instruction.
-            msg = ("Follow the instructions provided via standard input EXACTLY. "
-                   "Edit the target file, and you may also edit related tests in the "
-                   "tests/ directory if required by the instructions. Do not run git.")
-
-            # append the msg as the first prompt argument to the agent command
-            proc = run_capture(agent_cmd + [msg], stdin=prompt, timeout=agent.get("timeout_sec", 900))
+            # opencode reads the prompt from a -f attachment, not stdin.
+            fd, ptmp = tempfile.mkstemp(prefix="review_tool_", suffix=".md")
+            os.close(fd)
+            Path(ptmp).write_text(prompt, encoding="utf-8")
+            try:
+                msg = ("Follow the instructions in the attached file EXACTLY. "
+                       "Edit the target file, and you may also edit related tests in the "
+                       "tests/ directory if required by the instructions. Do not run git.")
+                proc = run_capture(agent_cmd + [msg, "-f", ptmp],
+                                   timeout=agent.get("timeout_sec", 900))
+            finally:
+                try:
+                    os.remove(ptmp)
+                except OSError:
+                    pass
         else:
             proc = run_capture(agent_cmd, stdin=prompt, timeout=agent.get("timeout_sec", 900))
     except subprocess.TimeoutExpired:
