@@ -136,39 +136,100 @@ class FileReview:
     severity: str = ""   # only the CLI (--agent) supplies this; the extension paste does not
 
 
-def get_review(cfg: dict, review_file: str | None = None) -> str:
-    """Return the raw review text by running the CodeRabbit CLI or reading a review file."""
+def coderabbit_args_builder(tool_cfg: dict, args) -> list[str]:
+    cmd = list(tool_cfg["cmd"])
+    if tool_cfg.get("dir"):
+        cmd.extend(["--dir", tool_cfg["dir"]])
+    mode = getattr(args, "mode", None)
+    if mode == "uncommitted":
+        cmd.append("--uncommitted")
+    elif mode == "committed":
+        cmd.append("--committed")
+    elif mode == "untracked":
+        cmd.extend(["--uncommitted", "--include-untracked"])
+    return cmd
+
+def coderabbit_parser(raw: str, cfg: dict) -> list[FileReview]:
+    return parse_review(raw, cfg)
+
+def greptile_args_builder(tool_cfg: dict, args) -> list[str]:
+    return ["greptile", "review", "--json"]
+
+def greptile_parser(raw: str, cfg: dict) -> list[FileReview]:
+    try:
+        match = re.search(r'(\[.*\]|\{.*\})', raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group(1))
+            return _parse_json_review(data)
+    except Exception:
+        pass
+    return []
+
+def kodus_args_builder(tool_cfg: dict, args) -> list[str]:
+    return ["kodus", "review", "--agent"]
+
+def kodus_parser(raw: str, cfg: dict) -> list[FileReview]:
+    try:
+        data = json.loads(raw.strip())
+        if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
+            data = data["data"]
+        return _parse_json_review(data)
+    except Exception:
+        return []
+
+REVIEW_TOOLS = {
+    "coderabbit": {"args_builder": coderabbit_args_builder, "parser": coderabbit_parser},
+    "greptile": {"args_builder": greptile_args_builder, "parser": greptile_parser},
+    "kodus": {"args_builder": kodus_args_builder, "parser": kodus_parser}
+}
+
+def get_selected_tool(args) -> str:
+    if getattr(args, "greptile", False):
+        return "greptile"
+    if getattr(args, "kodus", False):
+        return "kodus"
+    return "coderabbit"
+
+def get_review(cfg: dict, review_file: str | None = None, tool_name: str = "coderabbit", cmd: list[str] | None = None) -> str:
+    """Return the raw review text by running the chosen tool CLI or reading a review file."""
     if review_file:
         p = Path(review_file)
         if not p.is_file():
             sys.exit(c(f"Review file not found: {p}", "red"))
         return p.read_text(encoding="utf-8")
-    cr = cfg["coderabbit"]
-    inner = list(cr["cmd"])
-    if cr.get("dir"):
-        inner += ["--dir", cr["dir"]]
-    if cr.get("use_wsl"):
+
+    if tool_name == "coderabbit":
+        cr = cfg["coderabbit"]
+        inner = cmd or list(cr["cmd"])
+        use_wsl = cr.get("use_wsl")
+        timeout = cr.get("timeout_sec", 900)
+    else:
+        inner = cmd or REVIEW_TOOLS[tool_name]["args_builder"]({}, None)
+        use_wsl = False
+        timeout = 900
+
+    if use_wsl:
         wsl_cwd = win_to_wsl_path(REPO_ROOT)
         joined = " ".join(shlex.quote(a) for a in inner)
-        cmd = ["wsl", "bash", "-lc", f"cd {shlex.quote(wsl_cwd)} && {joined} </dev/null"]
-        missing_hint = "WSL not found. Install WSL and CodeRabbit inside it."
+        final_cmd = ["wsl", "bash", "-lc", f"cd {shlex.quote(wsl_cwd)} && {joined} </dev/null"]
+        missing_hint = f"WSL not found. Install WSL and {tool_name} inside it."
     else:
-        cmd = inner
-        missing_hint = f"CodeRabbit CLI not found ('{inner[0]}')."
-    
+        final_cmd = inner
+        missing_hint = f"{tool_name} CLI not found ('{inner[0]}')."
+
     try:
-        proc = run_capture(cmd, timeout=cr.get("timeout_sec", 900))
+        proc = run_capture(final_cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
-        sys.exit(c("CodeRabbit CLI timed out after " + str(cr.get("timeout_sec", 900)) + "s.\nTo speed it up, specify a 'dir' in config.json to limit the scope of the review.", "yellow"))
+        sys.exit(c(f"{tool_name} CLI timed out after {timeout}s.", "yellow"))
     except FileNotFoundError:
         sys.exit(c(missing_hint, "red"))
-    
+
     raw = proc.stdout or ""
     if not raw.strip() and proc.stderr:
         raw = proc.stderr
     if proc.returncode != 0 and not raw.strip():
-        where = "inside WSL" if cr.get("use_wsl") else ""
-        sys.exit(c(f"CodeRabbit exited {proc.returncode} with no output. Check auth {where}.", "red"))
+        where = "inside WSL" if use_wsl else ""
+        sys.exit(c(f"{tool_name} exited {proc.returncode} with no output. Check auth {where}.", "red"))
     return raw
 
 
@@ -344,6 +405,8 @@ def _parse_json_review(data) -> list[FileReview]:
     items = data if isinstance(data, list) else data.get("findings") or data.get("comments") or []
     blocks: dict = {}
     for it in items:
+        if not isinstance(it, dict):
+            continue
         f = it.get("file") or it.get("path") or it.get("filename")
         if not f:
             continue
@@ -672,7 +735,12 @@ def cmd_review(cfg: dict, args) -> None:
 
         print(c(f"Reading review ({review_file})...", "cyan"))
         raw = get_review(cfg, review_file)
-        reviews = parse_review(raw, cfg)
+        proc = load_processed()
+        tool_name = proc.get("tool") or "coderabbit"
+        if tool_name == "coderabbit":
+            reviews = parse_review(raw, cfg)
+        else:
+            reviews = REVIEW_TOOLS[tool_name]["parser"](raw, cfg)
 
         # STOP A: nothing parsed at all.
         if not reviews:
@@ -682,9 +750,8 @@ def cmd_review(cfg: dict, args) -> None:
 
         # Progress across runs: skip files already finished for THIS review text.
         rh = _review_hash(raw)
-        proc = load_processed()
         if args.fresh or proc.get("review_hash") != rh:
-            proc = {"review_hash": rh, "done": []}
+            proc = {"review_hash": rh, "done": [], "tool": tool_name}
             save_processed(proc)
         done_set = set(proc["done"])
         candidates = [r for r in reviews if r.file not in done_set]
@@ -859,10 +926,16 @@ def _iter_progress():
 
 
 def cmd_print_review(cfg: dict, args) -> None:
-    raw = get_review(cfg, getattr(args, "review_file", None))
+    tool_name = get_selected_tool(args)
+    raw = get_review(cfg, getattr(args, "review_file", None), tool_name)
     print(raw)
     print(c("\n--- parsed as (file -> its review text) ---", "cyan"))
-    reviews = parse_review(raw, cfg)
+
+    if tool_name == "coderabbit":
+        reviews = parse_review(raw, cfg)
+    else:
+        reviews = REVIEW_TOOLS[tool_name]["parser"](raw, cfg)
+
     if not reviews:
         print(c("  (no files detected - _file_header() needs calibrating to this format)", "yellow"))
     for r in reviews:
@@ -873,54 +946,57 @@ def cmd_print_review(cfg: dict, args) -> None:
 
 
 def cmd_fetch(cfg: dict, args) -> None:
-    """Run ONE CodeRabbit review and save it, so you can then work through it a file at a
+    """Run ONE tool review and save it, so you can then work through it a file at a
     time without burning a review (and a rate-limit slot) on every run."""
     ensure_state()
-    
-    # Allow overriding the review mode via CLI flags
-    forced = {**cfg, "coderabbit": {**cfg["coderabbit"], "source": "cli"}}
-    if getattr(args, "mode", None):
-        # Strip out any existing --type, --committed, --uncommitted, --include-untracked, --all-files flags
-        base_cmd = []
-        skip_next = False
-        for i, a in enumerate(forced["coderabbit"]["cmd"]):
-            if skip_next:
-                skip_next = False
-                continue
-            if a == "--type":
-                skip_next = True
-                continue
-            if a in ("--committed", "--uncommitted", "--include-untracked", "--all-files"):
-                continue
-            base_cmd.append(a)
-            
-        # Append the requested mode flag
-        if args.mode == "uncommitted":
-            base_cmd.append("--uncommitted")
-        elif args.mode == "committed":
-            base_cmd.append("--committed")
-        elif args.mode == "untracked":
-            base_cmd.extend(["--uncommitted", "--include-untracked"])
-        elif args.mode == "all":
-            # CodeRabbit might not have a single flag for "entire repo including committed",
-            # but usually omitting --uncommitted/--committed makes it run a full branch review.
-            pass
-            
-        forced["coderabbit"]["cmd"] = base_cmd
 
-    scope = forced["coderabbit"].get("dir") or "whole repo"
+    tool_name = get_selected_tool(args)
+
+    cmd = None
+    if tool_name == "coderabbit":
+        # Allow overriding the review mode via CLI flags
+        forced = {**cfg, "coderabbit": {**cfg["coderabbit"], "source": "cli"}}
+        if getattr(args, "mode", None):
+            # Strip out any existing --type, mode, and scope flags; the builder
+            # below re-adds the mode flag (and --dir) so each appears exactly once.
+            base_cmd = []
+            skip_next = False
+            for a in forced["coderabbit"]["cmd"]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if a in ("--type", "--dir"):
+                    skip_next = True
+                    continue
+                if a in ("--committed", "--uncommitted", "--include-untracked", "--all-files"):
+                    continue
+                base_cmd.append(a)
+            forced["coderabbit"]["cmd"] = base_cmd
+
+        scope = forced["coderabbit"].get("dir") or "whole repo"
+        cfg_to_use = forced
+        cmd = coderabbit_args_builder(cfg_to_use["coderabbit"], args)
+    else:
+        scope = "whole repo"
+        cfg_to_use = cfg
+        cmd = REVIEW_TOOLS[tool_name]["args_builder"]({}, args)
+
     mode_str = f" (mode: {args.mode})" if getattr(args, "mode", None) else ""
-    print(c(f"[{_PROJECT_KEY}] Running CodeRabbit ({scope}){mode_str}... this can take minutes.", "cyan"))
-    raw = get_review(forced, None)
+    print(c(f"[{_PROJECT_KEY}] Running {tool_name} ({scope}){mode_str}... this can take minutes.", "cyan"))
+    raw = get_review(cfg_to_use, None, tool_name, cmd)
     out = Path(args.out) if args.out else (STATE_DIR / "last_review.ndjson")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(raw, encoding="utf-8")
 
     # Reset progress when a new fetch is explicitly requested
-    save_processed({"review_hash": _review_hash(raw), "done": []})
+    save_processed({"review_hash": _review_hash(raw), "done": [], "tool": tool_name})
     clear_queue()
 
-    reviews = parse_review(raw, cfg)
+    if tool_name == "coderabbit":
+        reviews = parse_review(raw, cfg)
+    else:
+        reviews = REVIEW_TOOLS[tool_name]["parser"](raw, cfg)
+
     if not reviews:
         print(c("Review completed with no findings - nothing to fix.", "green"))
         return
@@ -973,10 +1049,17 @@ def main() -> None:
     p_pr = sub.add_parser("print-review", help="dump the raw review (calibration)")
     p_pr.add_argument("--review-file", dest="review_file", default=None,
                       help="read the review from this file instead of the CLI")
+    p_pr_tools = p_pr.add_mutually_exclusive_group()
+    p_pr_tools.add_argument("--greptile", action="store_true", help="Use Greptile instead of CodeRabbit")
+    p_pr_tools.add_argument("--kodus", action="store_true", help="Use Kodus instead of CodeRabbit")
 
-    p_f = sub.add_parser("fetch", help="run ONE CodeRabbit review and save it for repeated use")
+    p_f = sub.add_parser("fetch", help="run ONE tool review and save it for repeated use")
     p_f.add_argument("--out", default=None, help="where to save (default state/last_review.ndjson)")
-    
+
+    tool_group = p_f.add_mutually_exclusive_group()
+    tool_group.add_argument("--greptile", action="store_true", help="Use Greptile instead of CodeRabbit")
+    tool_group.add_argument("--kodus", action="store_true", help="Use Kodus instead of CodeRabbit")
+
     mode_group = p_f.add_mutually_exclusive_group()
     mode_group.add_argument("--uncommitted", dest="mode", action="store_const", const="uncommitted", 
                            help="Review staged changes and modified tracked files (default)")
