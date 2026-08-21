@@ -18,9 +18,7 @@
         "cmd": [
             "opencode",
             "run",
-            "--auto",
-            "-m",
-            "opencode/deepseek-v4-flash-free"
+            "--auto"
         ],
         "prompt_mode": "file",
         "timeout_sec": 900,

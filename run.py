@@ -457,6 +457,13 @@ _JSON_BLOCK_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL)
 def parse_worker_summary(stdout: str) -> dict | None:
     blocks = [b.strip() for b in _JSON_BLOCK_RE.findall(stdout)]
     if not blocks:
+        # Sometimes the agent omits the closing backticks entirely
+        m = re.search(r"```json\s*(.*)", stdout, re.DOTALL)
+        if m:
+            b = m.group(1).strip()
+            if b.endswith("```"): b = b[:-3].strip()
+            blocks = [b]
+    if not blocks:
         # last-ditch: a bare {...} at the end
         m = re.search(r"(\{.*\})\s*$", stdout, re.DOTALL)
         blocks = [m.group(1)] if m else []
@@ -555,12 +562,12 @@ def run_worker(cfg: dict, review: FileReview) -> dict:
         raise
     except Exception as e:
         sys.exit(c(f"Error executing agent: {e}", "red"))
-    _save_reasoning(review.file, prompt, proc.stdout or "")
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    _save_reasoning(review.file, prompt, out)
     low = out.lower()
     if any(marker in low for marker in agent.get("limit_markers", [])):
         raise LimitReached()
-    summary = parse_worker_summary(proc.stdout or "")
+    summary = parse_worker_summary(proc.stdout or "") or parse_worker_summary(out)
     if summary is None:
         summary = {"file": review.file, "applied": [], "skipped": [], "_no_summary": True}
     summary.setdefault("applied", [])
